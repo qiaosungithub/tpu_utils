@@ -1,0 +1,5 @@
+# Build/runtime artifacts -- never source of truth.
+__pycache__/
+*.pyc
+# Blaze convenience symlinks, if any ever land here.
+blaze-*
