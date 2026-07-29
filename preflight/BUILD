@@ -1,4 +1,4 @@
-load("//devtools/python/blaze:pytype.bzl", "pytype_strict_binary", "pytype_strict_library")
+load("//devtools/python/blaze:pytype.bzl", "pytype_strict_binary", "pytype_strict_library", "pytype_strict_contrib_test")
 
 package(default_visibility = ["//experimental/users/qiaos:__subpackages__"])
 
@@ -71,13 +71,13 @@ pytype_strict_binary(
     ],
 )
 
-pytype_strict_binary(
+pytype_strict_contrib_test(
     name = "market_test",
     srcs = ["market_test.py"],
     deps = [":market"],
 )
 
-pytype_strict_binary(
+pytype_strict_contrib_test(
     name = "router_test",
     srcs = ["router_test.py"],
     deps = [
