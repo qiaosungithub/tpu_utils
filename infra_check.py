@@ -252,6 +252,41 @@ _APPLICATION_ERROR_SIGNATURES = (
 )
 
 
+# How long after submission a missing work unit is still considered normal.
+# XManager creates the experiment record first and the work unit a moment later,
+# so a just-submitted job legitimately has none.
+_WORK_UNIT_GRACE_MINUTES = 15
+
+
+def _experiment_age_minutes(exp, job_info):
+  """Minutes since the experiment was created, or None if unknown.
+
+  Prefers XManager's own creation timestamp and falls back to the submission
+  time tpu_wrapper recorded in ~/.tpu_jobs.json, since the two are written by
+  different systems and either may be absent.
+  """
+  import datetime
+  created = getattr(exp, 'creation_time', None) or getattr(exp, 'create_time', None)
+  if created is not None:
+    try:
+      now = datetime.datetime.now(datetime.timezone.utc)
+      if created.tzinfo is None:
+        created = created.replace(tzinfo=datetime.timezone.utc)
+      return (now - created).total_seconds() / 60.0
+    except Exception:  # noqa: BLE001
+      pass
+  # ~/.tpu_jobs.json keys the log dir by timestamp: eqr_run_YYMMDD_HHMMSS.
+  logdir = str(job_info.get('logdir') or '')
+  match = re.search(r'_(\d{6})_(\d{6})$', logdir)
+  if match:
+    try:
+      stamp = datetime.datetime.strptime(match.group(1) + match.group(2), '%y%m%d%H%M%S')
+      return (datetime.datetime.now() - stamp).total_seconds() / 60.0
+    except ValueError:
+      pass
+  return None
+
+
 def _application_error(msg_upper):
     """Classify an application (not infra) failure, or return None.
 
@@ -436,17 +471,35 @@ def main(argv):
 
     for exp in experiments:
         exp_id = exp.id
+        fetch_error = ''
         try:
             work_units = list(exp.get_work_units())
-        except:
+        except Exception as exc:  # noqa: BLE001 - one bad experiment must not
+            # abort the whole table, but the reason must not be silently
+            # rewritten into 'config error' either.
             work_units = []
-            
+            fetch_error = type(exc).__name__
+
         name = exp.name if exp.name else str(exp_id)
         job_info = tpu_jobs_map.get(str(exp_id), {})
         step_str = str(_progress_step(job_info))
         if not work_units:
+            # Do NOT call this a config error. A freshly-submitted experiment has
+            # no work units for the first minute or so -- XManager creates the
+            # experiment record before the work unit exists -- and the fetch
+            # above can also fail transiently on an RPC. Both looked identical
+            # to a broken config, so two healthy PENDING jobs were reported as
+            # 'No WorkUnits (config error?)' while they were simply queuing.
+            # Age tells the two apart: minutes-old is normal, hours-old is not.
+            age = _experiment_age_minutes(exp, job_info)
+            if fetch_error:
+                detail = f"work units unreadable ({fetch_error}); retry"
+            elif age is not None and age < _WORK_UNIT_GRACE_MINUTES:
+                detail = f"just submitted {int(age)}m ago, work unit not created yet"
+            else:
+                detail = "No WorkUnits (config error?)"
             table_unknown.add_row(str(exp_id), "[dim]unknown[/dim]", name[:50],
-                                  "-", step_str, "No WorkUnits (config error?)")
+                                  "-", step_str, detail)
             continue
 
         resumes = _restart_count(work_units[0])
