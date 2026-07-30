@@ -486,7 +486,20 @@ def main(argv):
     args_user = FLAGS.user
 
     c = xmanager_api.XManagerApi()
-    console = Console(force_terminal=True, color_system="standard")
+    # Pin the width. Piped into the cache file rich cannot detect a terminal and
+    # falls back to 80 columns, which CLIPS the table -- and a clipped row loses
+    # its trailing box character, which is exactly what tpu_wrapper's cache
+    # parser keys on. Every job then fell back to "SUBMITTED".
+    # $COLUMNS wins when a human is looking at a real terminal.
+    _width = int(os.environ.get("TPU_CHECK_WIDTH") or os.environ.get("COLUMNS") or 0)
+    if _width < 80:
+        _width = 160
+    # `_environ={}` is load-bearing: rich re-reads $COLUMNS from the process
+    # environment and lets it OVERRIDE an explicit width=, so passing width
+    # alone silently kept the 80-column default. Hiding the environment from
+    # this Console is what makes the width stick.
+    console = Console(force_terminal=True, color_system="standard",
+                      width=_width, _environ={})
     
     table_running = Table(title="━━ running", show_header=True, header_style="bold green")
     table_pending = Table(title="━━ pending", show_header=True, header_style="bold yellow")
