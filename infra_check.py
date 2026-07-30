@@ -163,18 +163,118 @@ def derive_failure_reason(exp_id, failed_wu, tpu_info):
     if 'CAPACITY' in msg_upper or 'EXHAUSTED' in msg_upper or 'EXCEEDED' in msg_upper:
         return 'Pool Capacity Limit'
 
-    # Rule 6: nothing recognised. Do NOT invent a cause: XManager genuinely
+    # Rule 6: APPLICATION errors -- the job's own code broke, not the infra.
+    #
+    # This whole table exists to answer "is it me or is it Borg", and until now
+    # it could only say the latter. Every rule above is an infra verdict, so an
+    # application crash fell through to Rule 7, which printed the raw status
+    # message -- and Borg prefixes those with the job name, so the WHY column
+    # read `qiaos_group_275707651`, i.e. the job's own name as its cause. Four
+    # consecutive EqR-jax code bugs (a missing wandb attribute, os.makedirs on
+    # /cns, and two segfaults) were reported that way and each one needed
+    # why_probe to find out what the table already knew.
+    #
+    # These are deliberately checked AFTER the infra rules: a preemption during
+    # a crash loop is still a preemption, and infra causes are actionable in a
+    # different way (retry, move cell, raise a limit order) from code bugs
+    # (read the traceback, fix, resubmit).
+    #
+    # Marked "CODE BUG" so the verdict is unambiguous, with the concrete signal
+    # in parentheses, because the next action differs per signal: OOM means
+    # shrink the batch or ask for more RAM, SIGSEGV means read the stack.
+    app_error = _application_error(msg_upper)
+    if app_error:
+        return app_error
+
+    # Rule 7: nothing recognised. Do NOT invent a cause: XManager genuinely
     # returns an empty status message for some allocator rejections, and the
     # old code turned that silence into a confident-sounding
     # "Rejected by Allocator/Borg" for every PROD failure. Say so instead, and
     # point at the tool that can dig further.
     if msg and msg.strip() and msg.strip() != 'Failed' and 'Rejected' not in msg:
-        return msg.strip()
+        return _strip_job_prefix(msg.strip())
 
     state = str(getattr(failed_wu, 'status_name', '') or '').lower()
     if 'fail' in state:
         return 'Failed, no reason reported (try why_probe)'
     return 'Queued, no reason reported (try why_probe)'
+
+
+# Application-level failure signatures -> the verdict shown in the WHY column.
+# Ordered most-specific first; the first substring hit wins.
+#
+# Sources: Borg surfaces the signal name and its own wording in
+# `status.message` (go/xborg-why lists the task-level terminations), and the
+# Python exception itself arrives there for an unhandled crash because the
+# runtime writes it to stderr before the task exits.
+_APPLICATION_ERROR_SIGNATURES = (
+    # Fatal signals. 'SIGNAL 11' is how Borg words it ('Killed by signal 11!');
+    # 'SEGMENTATION FAULT' is the human sentence it puts alongside.
+    ('SEGMENTATION FAULT', 'CODE BUG: segfault (SIGSEGV)'),
+    ('SIGNAL 11', 'CODE BUG: segfault (SIGSEGV)'),
+    ('SIGSEGV', 'CODE BUG: segfault (SIGSEGV)'),
+    ('SIGNAL 6', 'CODE BUG: abort (SIGABRT)'),
+    ('SIGABRT', 'CODE BUG: abort (SIGABRT)'),
+    ('SIGNAL 8', 'CODE BUG: arithmetic fault (SIGFPE)'),
+    ('SIGNAL 4', 'CODE BUG: illegal instruction (SIGILL)'),
+    ('SIGNAL 7', 'CODE BUG: bus error (SIGBUS)'),
+    # Memory. Distinguished from a plain crash because the fix is different:
+    # smaller batch / more RAM, not a code read.
+    ('OUT OF MEMORY', 'CODE BUG: out of memory (raise RAM or shrink batch)'),
+    ('OUT-OF-MEMORY', 'CODE BUG: out of memory (raise RAM or shrink batch)'),
+    ('RESOURCE_EXHAUSTED: OOM', 'CODE BUG: out of memory (HBM)'),
+    ('OOM_KILLED', 'CODE BUG: out of memory (OOM-killed)'),
+    ('OOMKILLED', 'CODE BUG: out of memory (OOM-killed)'),
+    ('MEMORY LIMIT', 'CODE BUG: exceeded memory limit'),
+    # Python exceptions that reach the status message. PermissionError on /cns
+    # gets its own verdict: it is nearly always stdlib file I/O against a path
+    # that needs the epath helpers, not a real ACL problem.
+    ("PERMISSION DENIED: '/CNS", 'CODE BUG: stdlib I/O on /cns (use epath helpers)'),
+    ('PERMISSIONERROR', 'CODE BUG: PermissionError'),
+    ('MODULENOTFOUNDERROR', 'CODE BUG: missing module (packaging)'),
+    ('IMPORTERROR', 'CODE BUG: ImportError (packaging)'),
+    ('ATTRIBUTEERROR', 'CODE BUG: AttributeError'),
+    ('TYPEERROR', 'CODE BUG: TypeError'),
+    ('VALUEERROR', 'CODE BUG: ValueError'),
+    ('KEYERROR', 'CODE BUG: KeyError'),
+    ('FILENOTFOUNDERROR', 'CODE BUG: FileNotFoundError'),
+    ('ASSERTIONERROR', 'CODE BUG: AssertionError'),
+    ('RUNTIMEERROR', 'CODE BUG: RuntimeError'),
+    ('NOT_FOUND: COULD NOT FIND', 'CODE BUG: missing input file'),
+    ('XLARUNTIMEERROR', 'CODE BUG: XLA runtime error'),
+    ('JAXRUNTIMEERROR', 'CODE BUG: JAX runtime error'),
+    ('TRACEBACK (MOST RECENT CALL LAST)', 'CODE BUG: unhandled Python exception'),
+    # Borg's own phrasing for "your binary died on its own".
+    ('APPLICATION LEVEL ERROR', 'CODE BUG: application-level failure'),
+    ('UNRECOVERABLE FAILURE', 'CODE BUG: unrecoverable application failure'),
+    ('EXITED WITH NON-ZERO', 'CODE BUG: non-zero exit'),
+    ('NON-ZERO EXIT', 'CODE BUG: non-zero exit'),
+)
+
+
+def _application_error(msg_upper):
+    """Classify an application (not infra) failure, or return None.
+
+    Kept separate from `classify_failure_reason` so the signature table stays
+    readable and can be unit-tested directly.
+    """
+    for needle, verdict in _APPLICATION_ERROR_SIGNATURES:
+        if needle in msg_upper:
+            return verdict
+    return None
+
+
+def _strip_job_prefix(msg):
+    """Drop Borg's leading `<job_name>/<user>: ` from a status message.
+
+    Without this the WHY column shows the job's own name as its cause, which is
+    both useless and actively misleading -- `qiaos_group_275707651` reads like
+    an infra identifier rather than "we do not know".
+    """
+    head, sep, tail = msg.partition(': ')
+    if sep and '/' in head and ' ' not in head and tail.strip():
+        return tail.strip()
+    return msg
 
 
 def _restart_budget_exhausted(failed_wu, tpu_info):

@@ -37,7 +37,7 @@ pytype_strict_binary(
     ],
 )
 
-load("//devtools/python/blaze:pytype.bzl", "pytype_strict_binary", "pytype_strict_library")
+load("//devtools/python/blaze:pytype.bzl", "pytype_strict_binary", "pytype_strict_library", "pytype_strict_contrib_test")
 
 pytype_strict_library(
     name = "group_utils",
@@ -119,5 +119,26 @@ pytype_binary(
         "//net/proto2/python/public",
         "//third_party/py/absl:app",
         "//third_party/py/absl/flags:flags",
+    ],
+)
+
+# `infra_check` is a pytype_strict_binary, which a test target cannot depend on,
+# so the test compiles infra_check.py into itself rather than linking it. Same
+# self-asserting style as preflight/*_test.py -- it sys.exit(1)s on failure, and
+# must be a *_contrib_test or blaze silently never runs it.
+pytype_strict_contrib_test(
+    name = "infra_check_test",
+    srcs = [
+        "infra_check.py",
+        "infra_check_test.py",
+    ],
+    main = "infra_check_test.py",
+    deps = [
+        ":group_utils",
+        "//learning/deepmind/xmanager2/client:xmanager_api",
+        "//third_party/py/etils/epath",
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags:flags",
+        "//third_party/py/rich",
     ],
 )
