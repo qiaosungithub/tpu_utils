@@ -28,6 +28,15 @@ _LOCUS_TABLE: dict[str, dict[int, str]] = {
     # v6p = ghostfish (3-D torus)
     'v6p': {8: '2x2x2', 16: '2x2x4', 32: '2x4x4', 64: '4x4x4',
             128: '4x4x8', 256: '4x8x8', 512: '4x8x16'},
+    # v7 = ghostfishlite (3-D torus, 4 chips/host). Same slice geometry as v6p:
+    # platforms/accelerator_metadata/platforms/ghostfishlite.gcl declares the
+    # identical static sub-cube list (2x2x1, 2x2x2, 2x2x4, 2x4x4) with the same
+    # chips_per_host=4 and the same 4x4x4 entry commented out, and its dynamic
+    # slice expansion is the same multiple-of-4 rule capped at 4 cubes. The two
+    # files differ only in the locus name (DEPLOYMENT_TYPE_GHOSTFISH_LITE).
+    # 64+ needs dynamic slice creation (OCS manager), so stop at 32 until a
+    # larger shape is actually exercised.
+    'v7': {4: '2x2x1', 8: '2x2x2', 16: '2x2x4', 32: '2x4x4'},
     # v6e = ghostlite_pod (2-D torus, 8 chips/machine, pod = 16x16)
     'v6e': {8: '2_4', 16: '4_4', 32: '4_8', 64: '8_8',
             128: '8_16_wrap_y', 256: '16_16_wrap_xy'},
@@ -45,6 +54,8 @@ BORG_PLATFORM_KEY: dict[str, str] = {
     'v6p': 'GHOSTFISH',
     'v6e': 'GHOSTLITE_POD',
     'v5e': 'VIPERLITE_POD',
+    # GHOSTFISHLITE (101) is v7, NOT v5e/v6e -- see quota_check.py's note.
+    'v7': 'GHOSTFISHLITE',
 }
 
 # XManager-side codenames used by xm.JobRequirements() (matches money_check.py
@@ -55,6 +66,7 @@ XM_ACCELERATOR_KEY: dict[str, str] = {
     'v6p': 'tpu_ghostfish',
     'v6e': 'tpu_ghostlite_pod',
     'v5e': 'tpu_viperlite_pod',
+    'v7': 'tpu_ghostfishlite',
 }
 
 # Per-allocator hard minimum slice size overrides. These are POOL POLICIES,

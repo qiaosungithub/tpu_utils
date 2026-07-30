@@ -1,4 +1,5 @@
 import argparse
+import datetime
 import json
 import os
 import re
@@ -13,6 +14,74 @@ from rich.align import Align
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('user', 'qiaos', 'User LDAP')
+
+
+_JOBS_FILE = os.path.expanduser('~/.tpu_jobs.json')
+_LEGACY_FILE = os.path.expanduser('~/.tpu_jobs_legacy.json')
+
+
+def _load_json(path):
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _clear_jobs(job_ids, mapping_dir):
+    """Archive tracked jobs out of the status board.
+
+    Entries are MOVED to ~/.tpu_jobs_legacy.json rather than deleted: the record
+    carries the checkpoint bucket, staging dir and launch log, which is the only
+    way back to a finished run's artefacts. `tpu check` reads only the live
+    file, so archiving is enough to clean the board.
+
+    `tpu clear all` archives every entry; otherwise pass explicit XIDs.
+    """
+    if not job_ids:
+        print('Usage: tpu clear <xid> [xid...]   |   tpu clear all')
+        return
+
+    live = _load_json(_JOBS_FILE)
+    legacy = _load_json(_LEGACY_FILE)
+
+    if len(job_ids) == 1 and job_ids[0] == 'all':
+        targets = sorted(live)
+        # Legacy bucket-mapping dir predates ~/.tpu_jobs.json; sweep it too.
+        if os.path.isdir(mapping_dir):
+            targets += [f for f in os.listdir(mapping_dir) if f not in targets]
+    else:
+        targets = job_ids
+
+    archived, missing = [], []
+    for xid in targets:
+        found = False
+        if xid in live:
+            entry = dict(live.pop(xid))
+            entry['archived_at'] = datetime.datetime.now().isoformat(timespec='seconds')
+            legacy[xid] = entry
+            found = True
+        target_file = os.path.join(mapping_dir, xid)
+        if os.path.exists(target_file):
+            legacy.setdefault(xid, {}).setdefault(
+                'bucket_cp_path', open(target_file).read().strip())
+            os.remove(target_file)
+            found = True
+        (archived if found else missing).append(xid)
+
+    if archived:
+        with open(_LEGACY_FILE, 'w') as f:
+            json.dump(legacy, f, indent=2, sort_keys=True)
+        with open(_JOBS_FILE, 'w') as f:
+            json.dump(live, f, indent=2, sort_keys=True)
+        print(f'Archived {len(archived)} job(s) to {_LEGACY_FILE}')
+        print(f'  {len(live)} still tracked')
+    if missing:
+        print(f'Not tracked: {", ".join(missing)}')
+
+
 
 def derive_failure_reason(exp_id, failed_wu, tpu_info):
     """Human-readable reason for a work unit that is not making progress.
@@ -209,16 +278,7 @@ def main(argv):
     mapping_dir = os.path.expanduser('~/xm_job_to_bucket')
 
     if len(argv) > 1 and argv[1] == 'clear':
-        if len(argv) < 3:
-            print("Usage: tpu clear <job_id>")
-            sys.exit(1)
-        for job_to_clear in argv[2:]:
-            target_file = os.path.join(mapping_dir, job_to_clear)
-            if os.path.exists(target_file):
-                os.remove(target_file)
-                print(f"Cleared job: {job_to_clear}")
-            else:
-                print(f"Job {job_to_clear} not found in {mapping_dir}")
+        _clear_jobs(argv[2:], mapping_dir)
         sys.exit(0)
 
     args_user = FLAGS.user
