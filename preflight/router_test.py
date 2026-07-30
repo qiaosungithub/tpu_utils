@@ -133,7 +133,19 @@ print('--- power parsing / equivalence ---')
 check('v6e-16 == v5p-32 in power', router.parse_power_input('v6e-16'),
       router.parse_power_input('v5p-32'))
 check('bare int', router.parse_power_input('32'), 32.0)
-check('v4-32 == 32 v5p-equivalents', router.to_power('v4', 32), 32.0)
+# Ratios come from Borg's per-chip `vle` unit, cross-checked against ART MXU
+# bf16 FLOPs -- see router._V5P_MULTIPLIER. The old table said v4 == v5p and
+# v6p == 2x v5p; both were wrong, so these values are the regression guard.
+check('v4-32 == 19.2 v5p-equivalents (v4 is 0.60x, not 1.0x)',
+      router.to_power('v4', 32), 19.2)
+check('v6p is 4.34x v5p, not 2x', router.to_power('v6p', 1), 4.34)
+check('v7 matches v6p chip-for-chip (same GFC chip)',
+      router.to_power('v7', 8), router.to_power('v6p', 8))
+check('v6p-8 ~ v5p-32 within routing tolerance',
+      abs(router.to_power('v6p', 8) - router.to_power('v5p', 32)) < 5.0, True)
+check('v7 is enumerated as a routing candidate at its legal sizes',
+      ('v7', 16) in router._candidate_options(router.to_power('v7', 16)),  # pylint: disable=protected-access
+      True)
 
 print('--- _pick_offer: unobtainable cells are skipped ---')
 offers = [

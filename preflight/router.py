@@ -1,11 +1,19 @@
 """Local TPU router: from a desired power class to a (group, tpu_type, CELL).
 
-Power classes are compute-equivalence buckets. From xmanager.md's heuristic:
-  1 v6e chip ~ 2 v5p chips  =>  v6e-16 ~ v5p-32 ~ v4-32 (roughly)
+Power classes are compute-equivalence buckets, derived from Borg's published
+per-chip `vle` compute unit (see ``_V5P_MULTIPLIER`` below for the table and
+its two independent derivations):
+  1 v6p chip = 1 v7 chip ~ 4.34 v5p chips ~ 2.17 v6e chips
+  => v6p-8 ~ v7-8 ~ v6e-16 ~ v5p-32 (roughly)
 
 We express a "power class" as an integer in a canonical unit (v5p-chip units).
 The user either names a concrete type (``--power=v5p-32``) or a numeric class
 (``--power=32``, meaning "32 v5p-equivalent chips").
+
+This is a COMPUTE ratio. It does not predict memory-bound throughput, where the
+ordering can even invert (v6e has less HBM bandwidth than v5p). ``_V5P_MULTIPLIER``
+documents the caveats; surface them to the user rather than treating the score
+as a universal speed number.
 
 WHY there is a cell dimension
 -----------------------------
@@ -48,17 +56,51 @@ from google3.experimental.users.qiaos.tpu_utils.preflight import market
 from google3.experimental.users.qiaos.tpu_utils.preflight import preflight
 
 # Compute equivalence: (arch, chips) -> canonical v5p-chip units.
-# Heuristic: 1 v6e chip = 2 v5p chips; v4 = same as v5p (approx).
+#
+# Source of truth is the `vle` (v5e-equivalent) field that Borg publishes per
+# accelerator in //borg/util/reports/gxu/gxus_by_platform_ga.textproto. It is
+# the officially normalized per-chip bf16 compute unit; dividing every entry by
+# v5p's 2.33 gives the numbers below. Cross-checked against the per-chip MXU
+# bf16 FLOPs in the ART system models
+# (//platforms/deepsea/ffds/art/performance/systems/configs/*.textproto):
+#
+#   arch  chip           vle     MXU bf16   vle/2.33   flops/459e12
+#   v5e   viperlite      1.00     197 TF      0.43        0.43
+#   v4    pufferfish     1.40     275 TF      0.60        0.60
+#   v5p   viperfish      2.33     459 TF      1.00        1.00
+#   v6e   ghostlite_pod  4.66     918 TF      2.00        2.00
+#   v6p   ghostfish     10.11    1992 TF      4.34        4.34
+#   v7    ghostfishlite 10.11    1992 TF      4.34        4.34
+#
+# The two derivations agree to three digits, so these are real ratios rather
+# than a guess. NOTE the previous table claimed v6p = 2.0 and v4 = 1.0; both
+# understated the spread badly (v6p by >2x), which made `tpu route --power=`
+# recommend roughly twice the v6p/v7 hardware a request actually needs.
+#
+# Caveats this single scalar cannot express, so read them before trusting it:
+#  - It is a *compute* ratio only. HBM bandwidth does not track it: v6e has
+#    1.61 TB/s vs v5p's 2.77 TB/s, so despite scoring 2x on compute a v6e chip
+#    is SLOWER than v5p on memory-bound work (long-context attention, small
+#    batch decode). v6p/v7 are 7.37 TB/s, i.e. 2.7x v5p, well under their 4.34x
+#    compute ratio -- memory-bound jobs will not see the full speedup either.
+#  - Low-precision paths differ: v4/v5e/v5p/v6e accelerate int8 (2x) and int4
+#    (4x); v6p/v7 accelerate fp8 (2x) and give int8 NO speedup at all (1x). An
+#    int8-tuned model ported from v5p to v6p/v7 must move to fp8 to gain.
 _V5P_MULTIPLIER: dict[str, float] = {
-    'v4': 1.0,
+    'v5e': 0.43,
+    'v4': 0.60,
     'v5p': 1.0,
-    'v6p': 2.0,      # v6p is roughly 2x v5p (Ironwood).
-    'v6e': 2.0,      # 1 v6e chip ~ 2 v5p chips.
-    'v5e': 0.5,      # v5e is smaller/older; conservative.
+    'v6e': 2.0,
+    'v6p': 4.34,
+    'v7': 4.34,     # ghostfishlite: same GFC chip as v6p, identical per-chip perf.
 }
 
-# Preference between equally-good architectures: newer first.
-_ARCH_PREF: dict[str, int] = {'v6e': 0, 'v6p': 1, 'v5p': 2, 'v4': 3, 'v5e': 4}
+# Preference between equally-good architectures: newer first. v7 leads because
+# it matches v6p chip-for-chip yet repeatedly clears at the 0.00 free-pool price
+# when v6p has zero availability; it is capped at 32 chips in _LOCUS_TABLE, so
+# it simply drops out of the candidate set for larger requests.
+_ARCH_PREF: dict[str, int] = {
+    'v7': 0, 'v6p': 1, 'v6e': 2, 'v5p': 3, 'v4': 4, 'v5e': 5}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -166,7 +208,7 @@ def _candidate_options(target_power: float,
   # For each arch, iterate legal sizes and keep those in range.
   from google3.experimental.users.qiaos.tpu_utils.preflight import topology
   out: list[tuple[str, int]] = []
-  for arch in ['v6e', 'v5p', 'v6p', 'v4', 'v5e']:
+  for arch in ['v7', 'v6p', 'v6e', 'v5p', 'v4', 'v5e']:
     for chips in topology.legal_sizes_for(arch):
       p = to_power(arch, chips)
       if low <= p <= high:
