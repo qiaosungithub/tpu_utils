@@ -10,6 +10,7 @@ from google3.experimental.users.qiaos.tpu_utils import group_utils
 from google3.learning.deepmind.xmanager2.client import xmanager_api
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 from rich.align import Align
 
 FLAGS = flags.FLAGS
@@ -298,6 +299,61 @@ _UNINFORMATIVE_PENDING_REASONS = frozenset({
 })
 
 
+# How many trailing log lines to show under a running job, and how wide.
+_LOG_TAIL_LINES = 2
+_LOG_TAIL_WIDTH = 150
+
+# Lines that say nothing about progress. tqdm repaints a bar hundreds of times a
+# second, so without this the tail is always the same spinner frame.
+_LOG_TAIL_SKIP = (
+    'log-mirror', 'coordination flags', 'RuntimeWarning', 'warnings.warn',
+    'dtype = _resolve_stablemax', 'WARNING:', 'DeprecationWarning',
+)
+
+
+def _log_tail(job_info, lines: int = _LOG_TAIL_LINES) -> list[str]:
+  """The last few meaningful log lines of a running job, newest last.
+
+  Reads the rank log the application mirrors to the checkpoint bucket
+  (utils/logging_util.py::mirror_logs_to_bucket). Rank 0 is not always the
+  talkative one -- under pmap the process that owns the progress bar can be any
+  rank -- so pick whichever rank log is largest.
+
+  Never raises and never blocks for long: a status table that dies because a log
+  was unreadable is worse than one with no tail.
+  """
+  bucket = (job_info.get('bucket_cp_path') or '').strip()
+  if not bucket:
+    return []
+  try:
+    from etils import epath
+    logdir = epath.Path(bucket) / 'logs'
+    if not logdir.is_dir():
+      return []
+    candidates = sorted(logdir.iterdir(), key=lambda p: p.stat().length, reverse=True)
+    if not candidates:
+      return []
+    # Only the tail matters; reading a multi-MB log to show 2 lines is wasteful.
+    raw = candidates[0].read_bytes()[-16384:].decode('utf-8', errors='replace')
+  except Exception:  # noqa: BLE001 - the tail is a nicety, never a hard failure
+    return []
+
+  out: list[str] = []
+  # tqdm uses \r to repaint in place, so split on it too or the whole bar is
+  # one enormous "line".
+  for chunk in raw.replace('\r', '\n').splitlines():
+    line = chunk.strip()
+    if not line or any(skip in line for skip in _LOG_TAIL_SKIP):
+      continue
+    line = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', line).strip()
+    if not line:
+      continue
+    if len(line) > _LOG_TAIL_WIDTH:
+      line = line[:_LOG_TAIL_WIDTH - 1] + '…'
+    out.append(line)
+  return out[-lines:]
+
+
 def _application_error(msg_upper):
     """Classify an application (not infra) failure, or return None.
 
@@ -443,7 +499,9 @@ def main(argv):
     for table in tables:
         table.add_column("ID", style="dim")
         table.add_column("STATUS")
-        table.add_column("NAME", overflow="fold")
+        # Wide on purpose: for the running table this column also carries the
+        # log tail, and a 25-char tail is not worth printing.
+        table.add_column("NAME", overflow="fold", min_width=60)
         # RESUME = Borg task restarts observed; STEP = highest complete
         # checkpoint written to the bucket (0 when nothing saved yet).
         table.add_column("RESUME", justify="right")
@@ -548,6 +606,18 @@ def main(argv):
             details = f"{len([w for w in work_units if 'running' in w.status_name.lower()])} active"
             table_running.add_row(str(exp_id), "[green]running[/green]", name[:50],
                                   resume_str, step_str, details)
+            # Second row per run: what the job is actually SAYING. A status of
+            # "running" tells you Borg is happy, not that training is
+            # progressing -- a job wedged in a collective looks identical here.
+            # Same idea as unified_infra's dim indented continuation lines.
+            for line in _log_tail(job_info):
+                # `Text` + no_wrap: a log tail that soft-wraps inside the NAME
+                # column is unreadable, and truncation is the right trade -- the
+                # point is a glanceable "is it moving", not the full line.
+                table_running.add_row(
+                    "", "",
+                    Text(f"  │ {line}", style="dim", no_wrap=True, overflow="ellipsis"),
+                    "", "", "")
         elif is_error:
             failed_wu = next((w for w in work_units if "fail" in w.status_name.lower() or "error" in w.status_name.lower() or "cancel" in w.status_name.lower()), work_units[0])
             state_str = failed_wu.status_name.lower()
