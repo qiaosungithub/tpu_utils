@@ -287,6 +287,17 @@ def _experiment_age_minutes(exp, job_info):
   return None
 
 
+# Placeholder verdicts that carry no information for a QUEUED job. Rendering
+# them wastes the reader's attention on "the tool has nothing to say", which is
+# the default state of a healthy queued job.
+_UNINFORMATIVE_PENDING_REASONS = frozenset({
+    'No WorkUnits',
+    'Pending',
+    'Queued, no reason reported (try why_probe)',
+    'Failed, no reason reported (try why_probe)',
+})
+
+
 def _application_error(msg_upper):
     """Classify an application (not infra) failure, or return None.
 
@@ -547,12 +558,18 @@ def main(argv):
         elif is_pending:
             failed_wu = next((w for w in work_units if "fail" in w.status_name.lower() or "error" in w.status_name.lower() or "cancel" in w.status_name.lower()), work_units[0])
             reason = derive_failure_reason(exp_id, failed_wu, job_info)
-            if not reason or reason == 'No WorkUnits':
-                reason = 'Pending'
+            # A queued job usually has nothing to explain: XManager leaves
+            # status.message empty until something actually blocks it, and the
+            # fallbacks then invent filler like 'Queued, no reason reported'
+            # that occupies the eye without informing. Blank means "waiting,
+            # nothing wrong"; only a REAL blocker (a GQM price cap, a quota
+            # deficit, a prior preemption) earns text here.
+            if not reason or reason in _UNINFORMATIVE_PENDING_REASONS:
+                reason = ''
             if is_preempted and 'preempt' not in reason.lower():
                 # Genuinely still queued, but it has been preempted at least
                 # once before -- worth surfacing.
-                reason = f"{reason} (was preempted)"
+                reason = f"{reason} (was preempted)".strip()
             table_pending.add_row(str(exp_id), "[yellow]PENDING[/yellow]", name[:50],
                                   resume_str, step_str, reason)
         else:
