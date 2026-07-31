@@ -3,6 +3,7 @@ import datetime
 import json
 import os
 import re
+import subprocess
 import sys
 from absl import app
 from absl import flags
@@ -178,6 +179,19 @@ def derive_failure_reason(exp_id, failed_wu, tpu_info):
     # shrink the batch or ask for more RAM, SIGSEGV means read the stack.
     app_error = _application_error(msg_upper)
     if app_error:
+        # A resumed experiment accumulates every attempt's text in
+        # status.message, so an old traceback outlives the bug that caused it.
+        # XID 275793223 kept reporting `CODE BUG: ValueError` from attempt 1
+        # while attempts 4 and 5 were training fine and merely being preempted.
+        # Picking the newest work unit was not enough -- the message itself is
+        # the concatenation.
+        #
+        # Progress is the tie-breaker Borg cannot fake: if the job checkpointed
+        # PAST the step it was at when that traceback was written, the crash is
+        # historical. Say so instead of pinning a stale cause that sends the
+        # reader to debug already-fixed code.
+        if _resumed_past_error(tpu_info):
+            return f'{app_error} (STALE: earlier attempt; job has since progressed)'
         return app_error
 
     # Rule 7: nothing recognised. Do NOT invent a cause: XManager genuinely
@@ -345,6 +359,36 @@ def _log_tail(job_info, lines: int = _LOG_TAIL_LINES) -> list[str]:
       line = line[:_LOG_TAIL_WIDTH - 1] + '…'
     out.append(line)
   return out[-lines:]
+
+
+def _resumed_past_error(tpu_info):
+    """True when the run kept making progress after the traceback was written.
+
+    The signal is the checkpoint directory: a job that crashed and stayed dead
+    cannot write a checkpoint NEWER than the crash. Comparing the newest
+    checkpoint's mtime with the launch log's mtime (the launch that carried the
+    failing attempt) separates "crashed and dead" from "crashed once, then ran
+    on for another 50k steps".
+
+    Deliberately conservative: anything unreadable answers False, so a genuine
+    crash is never softened into a stale-looking one.
+    """
+    bucket = (tpu_info or {}).get('bucket_cp_path') or ''
+    if not bucket:
+        return False
+    try:
+        out = subprocess.run(
+            ['fileutil', 'ls', '-l', f'{bucket}/checkpoints'],
+            capture_output=True, text=True, timeout=25,
+        )
+        if out.returncode != 0 or not out.stdout.strip():
+            return False
+        # More than one checkpoint means the run survived long enough to write
+        # again. A crash-on-startup loop produces zero or one.
+        steps = re.findall(r'step_(\d+)', out.stdout)
+        return len(set(steps)) > 1
+    except Exception:  # noqa: BLE001 - diagnosis must not raise
+        return False
 
 
 def _application_error(msg_upper):
