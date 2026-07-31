@@ -642,6 +642,28 @@ def _cell_from_log(tpu_info):
     return ''
 
 
+# mach_locality's continent codes -> what a person calls the place. The codes
+# ('na', 'eu', 'ap') are precise and unreadable at a glance, which is the whole
+# problem this column exists to solve.
+_CONTINENT_NAMES = {
+    'na': 'us',
+    'sa': 'south-america',
+    'eu': 'europe',
+    'ap': 'asia',
+    'as': 'asia',
+    'au': 'australia',
+    'af': 'africa',
+    'me': 'middle-east',
+}
+
+
+def _continent_name(code):
+    """'eu' -> 'europe'. Unknown codes pass through rather than being hidden."""
+    if not code:
+        return ''
+    return _CONTINENT_NAMES.get(code.lower(), code.lower())
+
+
 _LOCALITY_CACHE = {}
 
 
@@ -706,7 +728,16 @@ def _region_of(work_units, tpu_info):
         return '?'
 
     metro, continent = _locality(cell)
-    label = f'{cell}/{metro}' if metro else cell
+    where = _continent_name(continent)
+    # `us (tul)` -- the region first because that is what is being asked, the
+    # metro in parentheses because it is what distinguishes two cells in the
+    # same region and what mach_locality speaks.
+    if where and metro:
+        label = f'{where} ({metro})'
+    elif where:
+        label = where
+    else:
+        label = f'{cell}/{metro}' if metro else cell
 
     # Compare against the bucket the job actually reads and writes.
     bucket = (tpu_info or {}).get('bucket_cp_path') or ''
@@ -714,7 +745,7 @@ def _region_of(work_units, tpu_info):
     if m and continent:
         _, data_continent = _locality(m.group(1))
         if data_continent and data_continent != continent:
-            return f'[red]{label}[/red] (data {data_continent})'
+            return f'[red]{label}[/red] [dim]data in {_continent_name(data_continent)}[/dim]'
     return label
 
 
