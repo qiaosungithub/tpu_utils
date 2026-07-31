@@ -1,4 +1,5 @@
 import argparse
+import concurrent.futures
 import datetime
 import json
 import os
@@ -318,31 +319,100 @@ _LOG_TAIL_SKIP = (
 )
 
 
-def _log_tail(job_info, lines: int = _LOG_TAIL_LINES) -> list[str]:
+# CNS round-trips dominate the tail, so they are issued concurrently. One pool
+# for the process: the client releases the GIL, and rebuilding a pool per call
+# would cost more than the reads. Sized for (jobs x ranks) in flight at once.
+_CNS_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+
+# How long the whole tail-fetching phase may take before we render without it.
+_LOG_TAIL_BUDGET_SEC = 8.0
+
+
+def _read_log_tail(bucket: str, nbytes: int = 16384) -> str:
+  """Raw tail bytes of the most active rank log under `bucket`, or ''.
+
+  Rank 0 is not always the talkative one -- under pmap the process that owns the
+  progress bar can be any rank -- so pick whichever rank log is LARGEST, which
+  needs one stat() per rank.
+
+  Two things here are deliberate, both measured against a live 1 MB job log:
+
+  * the per-rank stat() calls go through `_CNS_POOL` instead of running inside a
+    `sorted(key=...)`. That key function made them strictly serial, and with
+    4 ranks it was the single biggest cost in the tail (1271 ms -> 656 ms for
+    two jobs once parallelised).
+  * the read SEEKS to the tail rather than doing `read_bytes()[-16384:]`, which
+    downloaded the entire file and then threw away all but the last 16 KB. At
+    1 MB that is only ~1.4x -- small reads are dominated by the RPC round trip,
+    not by bytes -- but the old form grew without bound as the run went on,
+    which is exactly the regime a 100k-step job ends up in.
+
+  Never raises: a status table that dies because a log was unreadable is worse
+  than one with no tail.
+  """
+  try:
+    from etils import epath
+    logdir = epath.Path(bucket) / 'logs'
+    entries = [p for p in logdir.iterdir() if p.name.startswith('rank_')]
+    if not entries:
+      return ''
+
+    def _size(path):
+      try:
+        return path.stat().length
+      except Exception:  # noqa: BLE001 - a vanished rank file is not fatal
+        return -1
+
+    sizes = list(_CNS_POOL.map(_size, entries))
+    best = max(zip(sizes, range(len(entries))), key=lambda t: t[0])
+    if best[0] <= 0:
+      return ''
+    with entries[best[1]].open('rb') as handle:
+      try:
+        handle.seek(-nbytes, os.SEEK_END)
+      except OSError:
+        pass  # file shorter than the window; read it whole
+      return handle.read().decode('utf-8', errors='replace')
+  except Exception:  # noqa: BLE001 - the tail is a nicety, never a hard failure
+    return ''
+
+
+def _fetch_log_tails(buckets: list[str]) -> dict[str, str]:
+  """Tail every bucket at once. Missing/slow entries simply come back absent.
+
+  Fetching the whole table's tails concurrently is what keeps `tpu check`
+  interactive: the cost becomes that of the slowest single job rather than the
+  sum over jobs. The budget is a hard ceiling -- a wedged CNS cell must not be
+  able to hang the status table, so whatever has not arrived is dropped.
+  """
+  wanted = [b for b in dict.fromkeys(buckets) if b]
+  if not wanted:
+    return {}
+  futures = {b: _CNS_POOL.submit(_read_log_tail, b) for b in wanted}
+  out: dict[str, str] = {}
+  for bucket, fut in futures.items():
+    try:
+      raw = fut.result(timeout=_LOG_TAIL_BUDGET_SEC)
+    except Exception:  # noqa: BLE001 - timeout or read error: render without it
+      continue
+    if raw:
+      out[bucket] = raw
+  return out
+
+
+def _log_tail(job_info, lines: int = _LOG_TAIL_LINES, cache=None) -> list[str]:
   """The last few meaningful log lines of a running job, newest last.
 
   Reads the rank log the application mirrors to the checkpoint bucket
-  (utils/logging_util.py::mirror_logs_to_bucket). Rank 0 is not always the
-  talkative one -- under pmap the process that owns the progress bar can be any
-  rank -- so pick whichever rank log is largest.
-
-  Never raises and never blocks for long: a status table that dies because a log
-  was unreadable is worse than one with no tail.
+  (utils/logging_util.py::mirror_logs_to_bucket). `cache` is the prefetched
+  `{bucket: raw_tail}` from `_fetch_log_tails`; without it this falls back to
+  fetching synchronously, which is correct but serial.
   """
   bucket = (job_info.get('bucket_cp_path') or '').strip()
   if not bucket:
     return []
-  try:
-    from etils import epath
-    logdir = epath.Path(bucket) / 'logs'
-    if not logdir.is_dir():
-      return []
-    candidates = sorted(logdir.iterdir(), key=lambda p: p.stat().length, reverse=True)
-    if not candidates:
-      return []
-    # Only the tail matters; reading a multi-MB log to show 2 lines is wasteful.
-    raw = candidates[0].read_bytes()[-16384:].decode('utf-8', errors='replace')
-  except Exception:  # noqa: BLE001 - the tail is a nicety, never a hard failure
+  raw = cache.get(bucket) if cache is not None else _read_log_tail(bucket)
+  if not raw:
     return []
 
   out: list[str] = []
@@ -676,6 +746,15 @@ def main(argv):
         except Exception:
             pass
 
+    # Start every log tail NOW, before the per-experiment loop, so the CNS round
+    # trips overlap each other AND the XManager work-unit fetches below. Tailing
+    # inside the loop made the cost the SUM over jobs; here it is the max.
+    # Buckets are cheap to over-request -- a job that turns out not to be running
+    # just leaves an unused entry in the dict.
+    log_tails = _fetch_log_tails(
+        [(tpu_jobs_map.get(str(exp.id), {}) or {}).get('bucket_cp_path', '')
+         for exp in experiments])
+
     for exp in experiments:
         exp_id = exp.id
         fetch_error = ''
@@ -748,7 +827,7 @@ def main(argv):
             # "running" tells you Borg is happy, not that training is
             # progressing -- a job wedged in a collective looks identical here.
             # Same idea as unified_infra's dim indented continuation lines.
-            for line in _log_tail(job_info):
+            for line in _log_tail(job_info, cache=log_tails):
                 # `Text` + no_wrap: a log tail that soft-wraps inside the NAME
                 # column is unreadable, and truncation is the right trade -- the
                 # point is a glanceable "is it moving", not the full line.
