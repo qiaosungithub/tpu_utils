@@ -124,6 +124,20 @@ def _resolve_cap(limit_orders, my_mdbs, type_ids, tier):
     return None, None
 
 
+# Setters of limit orders that are not ours, collected while rendering so the
+# table can name them once in a footnote instead of on every row.
+_OTHERS_CAPS: set[str] = set()
+
+
+def _me() -> str:
+  """Current user, for deciding whether a limit order needs attribution."""
+  import getpass
+  try:
+    return getpass.getuser()
+  except Exception:  # noqa: BLE001
+    return ""
+
+
 def _limit_order_cell(limit_orders, my_mdbs, type_ids, tier, price_min, price_max):
     """Render the limit-order column: the cap, who set it, and whether it bites.
 
@@ -133,13 +147,30 @@ def _limit_order_cell(limit_orders, my_mdbs, type_ids, tier, price_min, price_ma
     """
     cap, user = _resolve_cap(limit_orders, my_mdbs, type_ids, tier)
     if cap is None:
+        # BATCH is NOT exempt from limit orders -- there is no priority filter
+        # anywhere in the trigger chain (market_algorithm/limit_order.cc). It
+        # simply has no rows: as of 2026-07-31 the whole LimitOrders table holds
+        # 49,085 PROD and 295 FREEBIE rows and ZERO BATCH ones. Say so, rather
+        # than printing a bare "none" that reads like "caps do not apply here".
+        if str(tier).upper() == "BATCH":
+            return "[dim]none set (BATCH is eligible, nobody uses it)[/dim]"
         return "[dim]none[/dim]"
+    # Do NOT print the setter on every row. These caps are MDB-wide and in
+    # practice one teammate's name repeats on nearly every line, so the column
+    # spends its width on a constant instead of on the number that decides
+    # whether the job runs. The name is still recoverable -- it is summarised
+    # once under the table, and `dynlo`/Spanner have the per-row detail.
+    # An entry set by YOU is worth calling out inline, since that is the one
+    # you can change directly.
+    owner = " [dim](yours)[/dim]" if user and user == _me() else ""
+    if user and user != _me():
+        _OTHERS_CAPS.add(user)
     if price_min is not None and price_min > cap:
         # Every cell we can see is above the cap: nothing can clear.
-        return f"[bold red]{cap:.2f} BLOCKS ALL[/bold red] [dim]({user})[/dim]"
+        return f"[bold red]{cap:.2f} BLOCKS ALL[/bold red]{owner}"
     if price_max is not None and price_max > cap:
-        return f"[yellow]{cap:.2f} blocks dear cells[/yellow] [dim]({user})[/dim]"
-    return f"[green]{cap:.2f} ok[/green] [dim]({user})[/dim]"
+        return f"[yellow]{cap:.2f} blocks dear cells[/yellow]{owner}"
+    return f"[green]{cap:.2f} ok[/green]{owner}"
 
 
 def _sample_cells(valid, per_band=2, cap=None):
@@ -496,6 +527,16 @@ def main(argv):
             price_table.add_row(f"[bold]{card_title}[/bold]", f"[{tier_color}]{tier_label}[/{tier_color}]", summary, lo_disp, cell_disp)
 
     out += render(price_table)
+    if _OTHERS_CAPS:
+        # Named once, not once per row. An MDB-wide cap set by a teammate applies
+        # to your jobs too (precedence is SCU > XID > MDB), so it is worth
+        # knowing who to ask -- but only once.
+        out += render(
+            "[dim]Limit orders above were set by: "
+            + ", ".join(sorted(_OTHERS_CAPS))
+            + ". They are MDB-wide and apply to your jobs too; override per-XID "
+            "with set_limit_order --xid=<xid> --price=<n>.[/dim]"
+        )
     out += render(
         "[dim]Balance = accumulated credits (stock) -> buys above-floor DRF "
         "weight; Bidding Power = credits/hr (flow) -> buys your floor. BOTH "
