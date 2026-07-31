@@ -109,29 +109,22 @@ def derive_failure_reason(exp_id, failed_wu, tpu_info):
 
     msg_upper = msg.upper()
 
-    # Rule 1: explicit preemption wording.
+    # Rules 1-2: preemption. ALWAYS name the cause -- "Preempted" alone does not
+    # say whether to resubmit as-is (defrag/higher-priority: nothing you can do,
+    # just resume), to raise a limit order (price), or to stop resuming
+    # (restart budget spent). `_preemption_cause` maps Borg/xborg wording onto
+    # that decision.
     if 'PREEMPTED' in msg_upper or 'PREEMPT' in msg_upper:
-        if 'HIGHER_PRIORITY' in msg_upper or 'HIGHER PRIORITY' in msg_upper:
-            return 'Preempted (Higher Priority)'
-        if 'DEFRAGMENTATION' in msg_upper or 'DEFRAG' in msg_upper:
-            return 'Preempted (Defrag)'
-        return 'Preempted'
+        return _preemption_verdict(msg_upper, failed_wu, tpu_info)
 
-    # Rule 2: DESCHEDULED == preempted. xborg does not use the word "preempt"
-    # when it takes resources back; it says the workload was "descheduled".
-    # Losing opportunistically-held capacity to an allotment with a guarantee
-    # is exactly a preemption from the job's point of view, and reporting it as
+    # DESCHEDULED == preempted. xborg does not use the word "preempt" when it
+    # takes resources back; it says the workload was "descheduled". Losing
+    # opportunistically-held capacity to an allotment with a guarantee is
+    # exactly a preemption from the job's point of view, and reporting it as
     # anything softer hides real preemption pressure.
     # go/xborg-why-descheduled#resource-guarantee-reclaim
     if 'DESCHEDULED' in msg_upper:
-        exhausted = _restart_budget_exhausted(failed_wu, tpu_info)
-        if 'RECLAIM' in msg_upper or 'GUARANTEED CAPACITY' in msg_upper:
-            base = 'Preempted (Guarantee Reclaim)'
-        elif 'DEFRAGMENTATION' in msg_upper or 'DEFRAG' in msg_upper:
-            base = 'Preempted (Defrag)'
-        else:
-            base = 'Preempted (Descheduled)'
-        return f'{base} + resume exceeds limit' if exhausted else base
+        return _preemption_verdict(msg_upper, failed_wu, tpu_info)
 
     # Rule 3: GQM pricing. Must precede the capacity rule below: the message
     # contains "exceed", but the workload is queued waiting for a lower price,
@@ -402,6 +395,94 @@ def _restart_budget_exhausted(failed_wu, tpu_info):
     return used is not None and used >= budget
 
 
+# Preemption causes, most specific first. Each entry is
+# (substrings, cause phrase). The phrase completes the sentence
+# "Preempted. Due to <phrase>" and should say what to DO, not just what Borg
+# called it -- the whole point of the column is to choose the next action.
+_PREEMPTION_CAUSES = (
+    (('SLICE_DEFRAGMENTATION', 'DEFRAGMENTATION', 'DEFRAG'),
+     'slice defrag (Borg repacking the pod; resume, same cell is fine)'),
+    (('HIGHER_PRIORITY', 'HIGHER PRIORITY', 'PRIORITY'),
+     'a higher-priority job taking the chips (resume; PROD already is prio 200)'),
+    (('RECLAIM', 'GUARANTEED CAPACITY', 'RESOURCE_GUARANTEE'),
+     'guarantee reclaim -- we were ABOVE floor, holding chips opportunistically'),
+    (('LIMIT_ORDER', 'LIMIT ORDER', 'PAUSED_BY_LIMIT_ORDER'),
+     'a GQM limit order: market price rose above the cap, so the job was paused'),
+    (('GQM_RESOURCE_DEFICIT', 'RESOURCE_DEFICIT'),
+     'a GQM resource deficit -- the auction did not clear enough chips this cycle'),
+    (('EVICT', 'EVICTION'), 'machine eviction (drain/repair)'),
+    (('MAINTENANCE', 'DRAIN'), 'scheduled machine maintenance'),
+    (('OUT_OF_CAPACITY', 'NO_CAPACITY', 'CAPACITY'),
+     'the cell running out of capacity for this slice shape'),
+)
+
+
+def _preemption_verdict(msg_upper, failed_wu, tpu_info):
+    """'Preempted. Due to <cause>' plus whether resuming is still allowed.
+
+    A bare 'Preempted' tells you the job stopped but not what to do next, and
+    the four cases want four different actions: defrag and higher-priority just
+    need a resume, a guarantee reclaim means we were running above floor, a
+    limit order means the price moved and the cap has to be raised before
+    anything will schedule, and an exhausted restart budget means resuming is
+    pointless until the budget is raised.
+    """
+    cause = None
+    for needles, phrase in _PREEMPTION_CAUSES:
+        if any(n in msg_upper for n in needles):
+            cause = phrase
+            break
+
+    if cause is None:
+        # Borg did not say. Do not guess a cause -- say that it did not, so the
+        # reader knows to look rather than trusting a fabricated reason.
+        verdict = 'Preempted. Cause not reported by Borg (try why_probe)'
+    else:
+        verdict = f'Preempted. Due to {cause}'
+
+    if _restart_budget_exhausted(failed_wu, tpu_info):
+        verdict += ' [restart budget SPENT -- resume will not be retried]'
+    return verdict
+
+
+def _latest_failed_wu(work_units):
+    """The MOST RECENT failed/cancelled work unit, else the most recent overall.
+
+    `--resume_xid` appends a work unit to the SAME experiment, so a long run
+    that has been preempted twice has three: WU 1 (crashed), WU 2 (crashed),
+    WU 3 (the live one). Picking the FIRST match -- which is what this used to
+    do -- pins the verdict to the oldest failure forever. XID 275793223 was
+    reported as `CODE BUG: ValueError` long after that bug was fixed, because
+    WU 1 still carried the original traceback while WU 3 had merely been
+    preempted. A stale cause is worse than none: it sends you to debug code
+    that is already correct.
+
+    Ordering is by work-unit id, which XManager assigns monotonically, with
+    `creation_time` as the fallback and list order as the last resort.
+    """
+    if not work_units:
+        return None
+
+    def _order(wu):
+        wid = getattr(wu, 'id', None)
+        if isinstance(wid, int):
+            return (2, wid)
+        created = getattr(wu, 'creation_time', None)
+        if created is not None:
+            try:
+                return (1, created.timestamp())
+            except Exception:  # noqa: BLE001 - not a datetime
+                pass
+        return (0, 0)
+
+    def _is_bad(wu):
+        state = str(getattr(wu, 'status_name', '') or '').lower()
+        return 'fail' in state or 'error' in state or 'cancel' in state
+
+    bad = [w for w in work_units if _is_bad(w)]
+    return max(bad or work_units, key=_order)
+
+
 def _restart_count(wu):
     """How many times Borg has restarted this work unit, or None if unknown.
 
@@ -632,14 +713,14 @@ def main(argv):
                     Text(f"  │ {line}", style="dim", no_wrap=True, overflow="ellipsis"),
                     "", "", "")
         elif is_error:
-            failed_wu = next((w for w in work_units if "fail" in w.status_name.lower() or "error" in w.status_name.lower() or "cancel" in w.status_name.lower()), work_units[0])
+            failed_wu = _latest_failed_wu(work_units)
             state_str = failed_wu.status_name.lower()
             color = "red" if "cancel" not in state_str else "yellow"
             message = derive_failure_reason(exp_id, failed_wu, job_info)
             table_error.add_row(str(exp_id), f"[{color}]{state_str}[/{color}]", name[:50],
-                                resume_str, step_str, message[:60])
+                                resume_str, step_str, message[:160])
         elif is_pending:
-            failed_wu = next((w for w in work_units if "fail" in w.status_name.lower() or "error" in w.status_name.lower() or "cancel" in w.status_name.lower()), work_units[0])
+            failed_wu = _latest_failed_wu(work_units)
             reason = derive_failure_reason(exp_id, failed_wu, job_info)
             # A queued job usually has nothing to explain: XManager leaves
             # status.message empty until something actually blocks it, and the
@@ -660,7 +741,7 @@ def main(argv):
             if "unknown" in state_str:
                 message = getattr(work_units[0], 'status_message', '') or 'unknown backend state'
                 table_unknown.add_row(str(exp_id), "[dim]unknown[/dim]", name[:50],
-                                      resume_str, step_str, message[:60])
+                                      resume_str, step_str, message[:160])
             else:
                 table_completed.add_row(str(exp_id), f"[magenta]{state_str}[/magenta]", name[:50],
                                         resume_str, step_str)
