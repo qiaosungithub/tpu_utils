@@ -201,7 +201,7 @@ def derive_failure_reason(exp_id, failed_wu, tpu_info):
     # "Rejected by Allocator/Borg" for every PROD failure. Say so instead, and
     # point at the tool that can dig further.
     if msg and msg.strip() and msg.strip() != 'Failed' and 'Rejected' not in msg:
-        return _strip_job_prefix(msg.strip())
+        return _humanize(_strip_job_prefix(msg.strip()))
 
     state = str(getattr(failed_wu, 'status_name', '') or '').lower()
     if 'fail' in state:
@@ -294,6 +294,54 @@ def _experiment_age_minutes(exp, job_info):
     except ValueError:
       pass
   return None
+
+
+# XManager/xborg phrasings that are accurate but unreadable at a glance, mapped
+# onto what the reader actually needs to decide: is this MY problem, and is
+# there anything to do? Each entry is (compiled regex, template). The template
+# may reference regex groups, so a percentage in the original survives into the
+# translation.
+#
+# The originals are kept verbatim in the tooltip-ish tail where they are short
+# enough; the point is that the FIRST words say what is going on.
+_HUMANIZE_RULES = (
+    # "86% of SCUs in your pool (98% within your allotment) are ..."
+    # An SCU is a scheduling unit; the sentence means the pool is full and this
+    # job is waiting its turn. Nothing is broken and there is nothing to fix.
+    (re.compile(r'(\d+)%\s+of\s+SCUs\s+in\s+your\s+pool.*?\((\d+)%\s+within\s+your\s+allot',
+                re.I | re.S),
+     'Waiting for chips: your group is {1}% full (pool {0}%). '
+     'Normal queueing -- it starts when a running job frees a slice.'),
+    (re.compile(r'SCUs?\s+in\s+your\s+pool', re.I),
+     'Waiting for chips: the pool is busy. Normal queueing, no action needed.'),
+    (re.compile(r'GQM_RESOURCE_DEFICIT', re.I),
+     'Waiting for chips: the 30s GQM auction did not clear enough for this job yet.'),
+    (re.compile(r'no\s+resources?\s+available|insufficient\s+capacity', re.I),
+     'Waiting for chips: no free slice of this shape in the cell right now.'),
+    (re.compile(r'work\s+unit\s+not\s+created\s+yet', re.I),
+     'Just submitted; XManager has not created the work unit yet.'),
+)
+
+
+def _humanize(msg):
+    """Rewrite an XManager status line into something readable at a glance.
+
+    `tpu check` is scanned, not read. A line like "86% of SCUs in your pool (98%
+    within your allotment) are ..." is precise and almost useless in that mode:
+    it does not say whether the job is broken, whose fault it is, or whether to
+    act. Unmatched messages pass through unchanged -- a wrong translation is
+    worse than an opaque original.
+    """
+    if not msg:
+        return msg
+    for pattern, template in _HUMANIZE_RULES:
+        m = pattern.search(msg)
+        if m:
+            try:
+                return template.format(*m.groups())
+            except (IndexError, KeyError):
+                return template
+    return msg
 
 
 # Placeholder verdicts that carry no information for a QUEUED job. Rendering
