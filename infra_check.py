@@ -372,6 +372,19 @@ _LOG_TAIL_SKIP = (
 # would cost more than the reads. Sized for (jobs x ranks) in flight at once.
 _CNS_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 
+# The per-rank stat() fan-out inside _read_log_tail MUST NOT share _CNS_POOL.
+# _read_log_tail itself runs ON a _CNS_POOL worker, so submitting its own work
+# back to that pool is a classic nested-executor deadlock: with more tracked
+# jobs than workers (16), every worker is occupied by an OUTER task waiting for
+# INNER tasks that can never be scheduled. The main thread escapes via
+# _LOG_TAIL_BUDGET_SEC and the table still renders, so the symptom is not a
+# slow table -- it is a process that prints everything and then never exits,
+# because concurrent.futures' atexit hook joins those wedged workers. That hung
+# `tpu_check_daemon.sh` on its `wait`, froze the money/quota caches, and made
+# `tpu money` report stale data every time. Two pools never deadlock: an inner
+# task only ever waits on a worker from a strictly different pool.
+_STAT_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+
 # How long the whole tail-fetching phase may take before we render without it.
 _LOG_TAIL_BUDGET_SEC = 8.0
 
@@ -385,10 +398,11 @@ def _read_log_tail(bucket: str, nbytes: int = 16384) -> str:
 
   Two things here are deliberate, both measured against a live 1 MB job log:
 
-  * the per-rank stat() calls go through `_CNS_POOL` instead of running inside a
-    `sorted(key=...)`. That key function made them strictly serial, and with
+  * the per-rank stat() calls go through `_STAT_POOL` instead of running inside
+    a `sorted(key=...)`. That key function made them strictly serial, and with
     4 ranks it was the single biggest cost in the tail (1271 ms -> 656 ms for
-    two jobs once parallelised).
+    two jobs once parallelised). The pool is deliberately NOT `_CNS_POOL` --
+    see the comment on `_STAT_POOL`.
   * the read SEEKS to the tail rather than doing `read_bytes()[-16384:]`, which
     downloaded the entire file and then threw away all but the last 16 KB. At
     1 MB that is only ~1.4x -- small reads are dominated by the RPC round trip,
@@ -411,7 +425,7 @@ def _read_log_tail(bucket: str, nbytes: int = 16384) -> str:
       except Exception:  # noqa: BLE001 - a vanished rank file is not fatal
         return -1
 
-    sizes = list(_CNS_POOL.map(_size, entries))
+    sizes = list(_STAT_POOL.map(_size, entries))
     best = max(zip(sizes, range(len(entries))), key=lambda t: t[0])
     if best[0] <= 0:
       return ''
@@ -607,6 +621,103 @@ def _preemption_verdict(msg_upper, failed_wu, tpu_info):
     return verdict
 
 
+def _cell_from_log(tpu_info):
+    """Borg cell parsed out of the job's mirrored log, or ''. Never raises."""
+    bucket = (tpu_info or {}).get('bucket_cp_path') or ''
+    if not bucket:
+        return ''
+    try:
+        raw = _read_log_tail(bucket, nbytes=200000) or ''
+    except Exception:  # noqa: BLE001
+        return ''
+    # `Compute cluster: yuskedq, metro: ske` -- printed by orbax and by far the
+    # most direct statement of where this task actually runs.
+    m = re.search(r'Compute cluster:\s*([a-z0-9-]+)', raw)
+    if m:
+        return m.group(1)
+    # Otherwise take a real cell out of a BNS path, skipping routing aliases.
+    for cand in re.findall(r'/bns/([a-z0-9-]+)/borg/([a-z0-9-]+)/', raw):
+        if cand[0] == cand[1] and not cand[0].startswith('vi'):
+            return cand[0]
+    return ''
+
+
+_LOCALITY_CACHE = {}
+
+
+def _locality(cell):
+    """(metro, continent) for a Borg cell, e.g. ('ske', 'eu'). Cached, never raises."""
+    if not cell:
+        return ('', '')
+    if cell in _LOCALITY_CACHE:
+        return _LOCALITY_CACHE[cell]
+    out = ('', '')
+    try:
+        vals = []
+        for kind in ('metro', 'continent'):
+            r = subprocess.run(['/usr/local/bin/mach_locality', '-k', kind, cell],
+                               capture_output=True, text=True, timeout=10)
+            parts = r.stdout.split()
+            vals.append(parts[1] if len(parts) > 1 else '')
+        out = (vals[0], vals[1])
+    except Exception:  # noqa: BLE001 - a display column must never break the tool
+        pass
+    _LOCALITY_CACHE[cell] = out
+    return out
+
+
+def _region_of(work_units, tpu_info):
+    """Where compute landed, flagged when it is not where the data lives.
+
+    Rendered as `<cell>/<metro>`, e.g. `yuskedq/ske`. Borg names cells, not GCP
+    regions -- there is no `us-central1` here -- so metro is the closest
+    equivalent and is what `mach_locality` speaks.
+
+    When the compute continent differs from the CHECKPOINT BUCKET's continent
+    the cell is shown in red with the remote continent appended. That mismatch
+    is not cosmetic: XID 275793223 was placed in ske/eu against a tul/na bucket
+    and spent 26 restarts re-reading a 4 MB checkpoint across the Atlantic
+    (223 s for the last attempt), never training a step.
+    """
+    cell = ''
+    # Preferred source, when XManager populates it.
+    for wu in work_units or []:
+        try:
+            for state in (wu.borg_job_states or []):
+                if getattr(state, 'cell', ''):
+                    cell = state.cell
+                    break
+        except Exception:  # noqa: BLE001
+            continue
+        if cell:
+            break
+
+    if not cell:
+        # Fallback: the job's own log. `borg_job_states` comes back EMPTY for a
+        # live work unit (verified against XID 275990419: states: 0), but the
+        # application prints the JAX coordinator BNS at startup, and a BNS path
+        # carries the cell:
+        #     /bns/viglobal/borg/viglobal/bns/qiaos/qiaos_group_<XID>.<WID>.main/0:jax
+        #                                                     ^ that is a routing
+        # alias, so prefer a concrete `/bns/<cell>/borg/<cell>/` when present.
+        cell = _cell_from_log(tpu_info)
+
+    if not cell:
+        return '?'
+
+    metro, continent = _locality(cell)
+    label = f'{cell}/{metro}' if metro else cell
+
+    # Compare against the bucket the job actually reads and writes.
+    bucket = (tpu_info or {}).get('bucket_cp_path') or ''
+    m = re.match(r'/cns/([a-z0-9-]+?)-d/', bucket)
+    if m and continent:
+        _, data_continent = _locality(m.group(1))
+        if data_continent and data_continent != continent:
+            return f'[red]{label}[/red] (data {data_continent})'
+    return label
+
+
 def _latest_failed_wu(work_units):
     """The MOST RECENT failed/cancelled work unit, else the most recent overall.
 
@@ -763,6 +874,13 @@ def main(argv):
         table.add_column("RESUME", justify="right")
         table.add_column("STEP", justify="right")
         if table is table_running:
+             # WHERE the job actually landed. XManager picks the cell, and a job
+             # whose compute is on another continent from its checkpoint bucket
+             # spends its life re-reading state over an ocean -- XID 275793223
+             # was restarted 26 times doing exactly that (compute ske/eu,
+             # storage tul/na, 4 MB checkpoint taking 223 s to load). That is
+             # invisible unless the placement is on screen.
+             table.add_column("REGION")
              table.add_column("DETAILS")
         if table is table_pending or table is table_error or table is table_unknown:
              table.add_column("WHY", overflow="fold")
@@ -869,8 +987,9 @@ def main(argv):
         # like they were still queued for hours.
         if is_running:
             details = f"{len([w for w in work_units if 'running' in w.status_name.lower()])} active"
+            region = _region_of(work_units, job_info)
             table_running.add_row(str(exp_id), "[green]running[/green]", name[:50],
-                                  resume_str, step_str, details)
+                                  resume_str, step_str, region, details)
             # Second row per run: what the job is actually SAYING. A status of
             # "running" tells you Borg is happy, not that training is
             # progressing -- a job wedged in a collective looks identical here.
@@ -882,7 +1001,7 @@ def main(argv):
                 table_running.add_row(
                     "", "",
                     Text(f"  │ {line}", style="dim", no_wrap=True, overflow="ellipsis"),
-                    "", "", "")
+                    "", "", "", "")
         elif is_error:
             failed_wu = _latest_failed_wu(work_units)
             state_str = failed_wu.status_name.lower()
