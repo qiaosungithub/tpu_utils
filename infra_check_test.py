@@ -85,6 +85,47 @@ check_contains('gqm price', 'GQM_RESOURCE_DEFICIT_INFO: waiting for price', None
 check_contains('capacity', 'Pool capacity exhausted', None)
 check_contains('defrag', 'Preempted (SLICE_DEFRAGMENTATION)', None)
 
+# --- A price cap and an empty auction are DIFFERENT verdicts. ----------------
+# These three messages used to collapse into one string, "Queued (GQM price
+# over limit order)", which pointed at the wrong lever for two of them: a real
+# v6p-64 probe was reported as price-capped while its group had no row in the
+# cap table at all and the market cleared 10x below the cap. The fix a reader
+# takes differs in each case, so the verdict has to differ too.
+
+
+def check_reason(label: str, message: str, expected: str) -> None:
+  """Assert the full derive_failure_reason verdict for a work-unit message."""
+
+  class _Status:
+
+    def __init__(self, text: str):
+      self.message = text
+
+  class _WU:
+
+    def __init__(self, text: str):
+      self.status = _Status(text)
+
+  check(label, infra_check.derive_failure_reason('xid', _WU(message), {}),
+        expected)
+
+
+check_reason(
+    'a real price cap says so',
+    'Workload paused: market price above LIMIT ORDER for this experiment',
+    'Queued (GQM price over limit order)')
+check_reason(
+    'an auction shortfall is NOT a price cap',
+    'GQM_RESOURCE_DEFICIT_INFO ... deficit: tier HighlyAvailable '
+    '{ GHOSTFISH=19.00 } in cell yucbfiv',
+    'Queued (GQM auction short of chips)')
+check_reason(
+    'an oversold cell names the cell as the fix',
+    'Your workload can afford GHOSTFISH on a global market, but in cell '
+    'yutulpz the demand from admitted jobs exceeds the available cell supply. '
+    'See GQM_OVERSOLD_MARKET.',
+    'Queued (cell oversold; try another cell)')
+
 # --- The job-name prefix must be stripped from unrecognised messages. --------
 
 check('strip job prefix',

@@ -128,11 +128,34 @@ def derive_failure_reason(exp_id, failed_wu, tpu_info):
     if 'DESCHEDULED' in msg_upper:
         return _preemption_verdict(msg_upper, failed_wu, tpu_info)
 
-    # Rule 3: GQM pricing. Must precede the capacity rule below: the message
-    # contains "exceed", but the workload is queued waiting for a lower price,
-    # not short of capacity. It is still alive and may schedule later.
-    if 'GQM_RESOURCE_DEFICIT' in msg_upper or 'LIMIT ORDER' in msg_upper:
+    # Rule 3: the GQM market. TWO DIFFERENT CAUSES LIVE HERE AND MUST NOT SHARE
+    # A VERDICT -- they point at opposite fixes:
+    #
+    #   * a LIMIT ORDER is a price cap somebody typed. The job is pulled from
+    #     the queue before any capacity check, so free chips do not help; the
+    #     fix is to raise or remove the cap.
+    #   * a RESOURCE DEFICIT is the auction not clearing enough chips this
+    #     cycle. No cap is involved; the fix is another cell, another tier, or
+    #     waiting. Raising a cap does nothing at all.
+    #
+    # Collapsing them cost real debugging time: a v6p-64 probe whose work unit
+    # said `GQM_RESOURCE_DEFICIT_INFO ... deficit GHOSTFISH=19 in cell yucbfiv`
+    # was reported as "price over limit order" while its group had NO row in the
+    # cap table at all and the market cleared at 17.75 against a 180 cap. The
+    # rest of this file already separates the two (see _WHY_HINTS and the
+    # pending-reason table below); only this verdict did not.
+    #
+    # Order matters: check the cap first, because a limit-order message can also
+    # carry the word "deficit", but a deficit message never names a cap.
+    if 'LIMIT ORDER' in msg_upper or 'LIMIT_ORDER' in msg_upper:
         return 'Queued (GQM price over limit order)'
+    if 'GQM_RESOURCE_DEFICIT' in msg_upper:
+        return 'Queued (GQM auction short of chips)'
+    # An oversold cell is a third, distinct verdict: the workload can afford the
+    # global price, but the cell it is pinned to has no supply. Naming it is
+    # what tells the reader to unpin the cell rather than touch the price.
+    if 'GQM_OVERSOLD_MARKET' in msg_upper or 'OVERSOLD' in msg_upper:
+        return 'Queued (cell oversold; try another cell)'
 
     # Rule 4: structural errors visible only in the launch log.
     launch_log = tpu_info.get('launch_log')
