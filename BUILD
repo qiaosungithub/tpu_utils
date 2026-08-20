@@ -142,3 +142,20 @@ pytype_strict_contrib_test(
         "//third_party/py/rich",
     ],
 )
+
+# Placeable slices per cell, which is NOT the obtainable-chip count preflight
+# prints: `yutulpz` showed 1616 free v7 chips while the production run was
+# being descheduled there for want of a contiguous 2x4x4.
+pytype_strict_binary(
+    name = "slice_probe",
+    srcs = ["slice_probe.py"],
+    deps = [
+        "//borg/common:scalar_resource_py_pb2",
+        "//borg/xborg/frontend/goodput_optimizer/proto:goodput_optimizer_service_py_pb2",
+        "//learning/deepmind/xmanager2/client:resource_service",
+        "//net/rpc/python/contrib:rpc_factory_factory",
+        "//net/rpc2/contrib/smartservice/python:smartservice_util",
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags:flags",
+    ],
+)
