@@ -952,7 +952,19 @@ def main(argv):
         try:
             with open(tpu_jobs_json, "r") as f:
                 tpu_jobs_map = json.load(f)
-                active_ids.update(tpu_jobs_map.keys())
+                # Terminal jobs never change state again, so issuing one serial
+                # get_experiment RPC per terminal id only inflates the round.
+                # A registry accretes hundreds of these; ~400 terminal rows
+                # pushed a round past 360s and starved the money/quota caches
+                # past their 300s staleness alarm. Drop them from the poll set
+                # here -- they remain in the registry (and legacy file); this is
+                # purely which ids get polled each round. tpu_jobs_map itself is
+                # left whole, so the bucket lookups below still resolve.
+                _TERMINAL_STATUS = {"TERMINAL_RECONCILED", "CANCELLED"}
+                active_ids.update(
+                    x for x, v in tpu_jobs_map.items()
+                    if (v or {}).get("status") not in _TERMINAL_STATUS
+                )
         except Exception:
             pass
 
