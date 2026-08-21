@@ -19,8 +19,14 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string('user', 'qiaos', 'User LDAP')
 
 
-_JOBS_FILE = os.path.expanduser('~/.tpu_jobs.json')
-_LEGACY_FILE = os.path.expanduser('~/.tpu_jobs_legacy.json')
+# Scope by the same env vars every other consumer reads (tpu_wrapper.sh, the
+# daemon): unset = the historical hardcoded paths, so single-operator behaviour
+# is unchanged. Without this the guest daemon's infra pass read the OWNER's
+# registry -- the one remaining unscoped consumer after the registry split.
+_JOBS_FILE = os.path.expanduser(
+    os.environ.get('TPU_JOBS_FILE') or '~/.tpu_jobs.json')
+_LEGACY_FILE = os.path.expanduser(
+    os.environ.get('TPU_JOBS_LEGACY_FILE') or '~/.tpu_jobs_legacy.json')
 
 
 def _load_json(path):
@@ -947,7 +953,7 @@ def main(argv):
         pass
 
     tpu_jobs_map = {}
-    tpu_jobs_json = os.path.expanduser("~/.tpu_jobs.json")
+    tpu_jobs_json = _JOBS_FILE
     if os.path.exists(tpu_jobs_json):
         try:
             with open(tpu_jobs_json, "r") as f:
