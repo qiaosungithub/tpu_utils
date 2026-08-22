@@ -268,3 +268,32 @@ pytype_strict_contrib_test(
         "//third_party/py/absl/flags:flags",
     ],
 )
+
+# Cell picker: what makes smart cell selection the DEFAULT of `tpu queue`.
+# One GetCellAvailability RPC for the requested type, ranked by route_lib, prints
+# the best placeable cell (or nothing -> the wrapper falls back to the allocator).
+pytype_strict_library(
+    name = "pick_cell_lib",
+    srcs = ["pick_cell.py"],
+    deps = [
+        ":avail_provider",
+        ":route_lib",
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags:flags",
+    ],
+)
+
+pytype_strict_binary(
+    name = "pick_cell",
+    srcs = ["pick_cell.py"],
+    deps = [":pick_cell_lib"],
+)
+
+pytype_strict_contrib_test(
+    name = "pick_cell_test",
+    srcs = ["pick_cell_test.py"],
+    deps = [
+        ":pick_cell_lib",
+        ":route_lib",
+    ],
+)
