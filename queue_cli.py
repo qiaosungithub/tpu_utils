@@ -200,6 +200,9 @@ def _cmd_status(argv: list[str]) -> int:
       else:
         why = e.last_reason or '(availability unknown)'
       state_disp = _c('36', e.state.value)
+    elif e.state == route_lib.JobState.BUILDING:
+      why = _c('35', f'building now (worker {e.worker_id or "?"}): {e.last_reason}')
+      state_disp = _c('1;35', e.state.value)
     elif e.state == route_lib.JobState.SUBMITTED:
       why = f'xid={e.xid} cell={e.cell} {e.arch}-{e.chips}; {e.last_reason}'
       state_disp = _c('34', e.state.value)

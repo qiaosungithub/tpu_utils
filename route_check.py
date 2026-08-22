@@ -28,7 +28,7 @@ import os
 import re
 import subprocess
 import time
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 from absl import app
 from absl import flags
@@ -103,6 +103,19 @@ _REROUTE_AFTER_S = flags.DEFINE_float(
 _COOLDOWN_S = flags.DEFINE_float(
     'cooldown_s', 1800.0, 'After a re-route, avoid the stuck cell for this long '
     'so the job does not bounce straight back into it.')
+_WORKER = flags.DEFINE_bool(
+    'worker', False, 'Run as the SERIAL build-worker loop: claim one QUEUED job '
+    'at a time as BUILDING, run `tpu queue` for it, record the result, repeat. '
+    'Only ever one build in flight -- the cure for concurrent-build failures.')
+_WORKER_POLL_S = flags.DEFINE_float(
+    'worker_poll_s', 15.0, 'Worker idle poll interval when the queue is empty.')
+_BUILD_STALE_S = flags.DEFINE_float(
+    'build_stale_s', 1800.0, 'A BUILDING claim older than this is treated as a '
+    'crashed worker and reclaimed to QUEUED (a real build is minutes).')
+_SRCFS_FAIL_BRAKE = flags.DEFINE_integer(
+    'srcfs_fail_brake', 20, 'If this many NEW srcfs/CreateSnapshot failures '
+    'appear between two polls, skip claiming a build this round (the CitC token '
+    'bucket is draining). 0 disables the brake.')
 
 
 # --- queue persistence (atomic, flock'd, like ~/.tpu_jobs.json) -----------
@@ -143,6 +156,66 @@ def save_queue(path: str, entries: list[route_lib.QueueEntry]) -> None:
     finally:
       fcntl.flock(f, fcntl.LOCK_UN)
   os.replace(tmp, path)
+
+
+# --- atomic claim / update (the cross-process serial lock) -----------------
+# The single-build invariant must hold across SEPARATE worker processes, not
+# just within one. load_queue+save_queue each take the lock briefly, so a
+# read-modify-write done as two calls has a window where two workers both see
+# 'no build in flight' and both claim. So the CLAIM is one read-modify-write
+# under ONE held exclusive lock on a sidecar lockfile.
+def _lockfile(path: str) -> str:
+  return f'{path}.lock'
+
+
+def claim_next_build(path: str, now: float, worker_id: str,
+                     stale_after_s: float) -> Optional[route_lib.QueueEntry]:
+  """Atomically: reclaim stale BUILDING, then IF no live build is in flight,
+  mark the next QUEUED entry BUILDING and persist. Returns the claimed entry
+  (a copy reflecting the persisted state) or None if nothing was claimed
+  (queue empty, or a build already in flight). Serialized by an exclusive
+  flock held across the whole read-modify-write."""
+  lock_path = _lockfile(path)
+  with open(lock_path, 'w') as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+      entries = load_queue(path)
+      route_lib.reclaim_stale_building(entries, now, stale_after_s)
+      if not route_lib.can_claim_build(entries, now, stale_after_s):
+        save_queue(path, entries)   # persist any reclaim even if we don't claim
+        return None
+      nxt = route_lib.next_queued(entries)
+      if nxt is None:
+        save_queue(path, entries)
+        return None
+      route_lib.claim_for_build(nxt, now, worker_id)
+      save_queue(path, entries)
+      return nxt
+    finally:
+      fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def update_entry(path: str, job_id: str,
+                 mutate: 'Callable[[route_lib.QueueEntry], None]') -> bool:
+  """Atomically apply `mutate` to the entry with `job_id` and persist. Returns
+  True if the entry was found. Used to write the post-build result (SUBMITTED,
+  or back to QUEUED) without clobbering concurrent edits to other entries."""
+  lock_path = _lockfile(path)
+  with open(lock_path, 'w') as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+      entries = load_queue(path)
+      found = False
+      for e in entries:
+        if e.job_id == job_id:
+          mutate(e)
+          found = True
+          break
+      if found:
+        save_queue(path, entries)
+      return found
+    finally:
+      fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 # --- pure helpers ---------------------------------------------------------
@@ -417,8 +490,181 @@ def _tail(s: str, n: int = 240) -> str:
   return s[-n:]
 
 
+# --- the serial build-worker ----------------------------------------------
+class _StageHealthProbe(Protocol):
+  """Returns the cumulative count of srcfs/CreateSnapshot write failures right
+  now. The worker brakes if this jumps between polls (the CitC token bucket is
+  draining -- concurrent stage-writes elsewhere). Backed by a log/RPC probe in
+  production, scripted in tests."""
+
+  def failure_count(self) -> int:
+    ...
+
+
+def plan_one_entry(
+    entry: route_lib.QueueEntry,
+    provider: _Provider,
+    now: float,
+) -> Optional[route_lib.Placement]:
+  """Pick a placement for ONE already-claimed entry, using live availability.
+  Same policy as the tick (effective-price type, most-placeable cell), but for a
+  single entry -- the worker has already chosen WHICH job via the queue order."""
+  try:
+    avail_by_cell, arch_price, arch_pool = provider.fetch()
+  except Exception as e:  # pylint: disable=broad-except
+    entry.last_reason = f'availability fetch failed: {e}'
+    return None
+  return route_lib.plan_one(entry, avail_by_cell, now,
+                            arch_price=arch_price, arch_pool=arch_pool)
+
+
+def run_worker_once(
+    queue_file: str,
+    provider: _Provider,
+    submitter: _Submitter,
+    now: float,
+    worker_id: str,
+    build_stale_s: float = 1800.0,
+    group: str = DEFAULT_GROUP,
+    stage_probe: Optional[_StageHealthProbe] = None,
+    srcfs_fail_brake: int = 20,
+    last_fail_count: Optional[int] = None,
+) -> tuple[str, list[str], Optional[int]]:
+  """One worker step. Returns (outcome, log_lines, new_fail_count).
+
+  outcome is one of: 'submitted', 'requeued', 'idle' (nothing to build),
+  'busy' (a build already in flight), 'braked' (srcfs failures spiking).
+
+  The single-build invariant is enforced by claim_next_build (atomic, flock'd):
+  at most one entry is BUILDING across all worker processes. This step claims
+  one, runs `tpu queue` for it (the ONE build), and records the result.
+  """
+  log: list[str] = []
+  new_fail_count = last_fail_count
+
+  # MODE-2 BRAKE: if srcfs write failures jumped since last poll, the CitC token
+  # bucket is draining -- do not add a stage-write. Skip this round.
+  if stage_probe is not None and srcfs_fail_brake > 0:
+    try:
+      cur = stage_probe.failure_count()
+      new_fail_count = cur
+      if last_fail_count is not None and (cur - last_fail_count) >= srcfs_fail_brake:
+        log.append(f'[worker] BRAKE: {cur - last_fail_count} new srcfs failures '
+                   f'since last poll (>= {srcfs_fail_brake}); skipping this round '
+                   'to let the CitC token bucket recover.')
+        return 'braked', log, new_fail_count
+    except Exception as e:  # pylint: disable=broad-except
+      log.append(f'[worker] stage-health probe failed ({e}); proceeding without brake.')
+
+  # ATOMIC CLAIM: reclaim stale, then take the next QUEUED as BUILDING iff no
+  # live build is in flight. This is the serial lock.
+  claimed = claim_next_build(queue_file, now, worker_id, build_stale_s)
+  if claimed is None:
+    # Distinguish 'a build is in flight' from 'nothing to do' for the log.
+    entries = load_queue(queue_file)
+    if route_lib.count_building(entries) > 0:
+      return 'busy', log, new_fail_count
+    return 'idle', log, new_fail_count
+
+  log.append(f'[worker] claimed {claimed.job_id} (BUILDING); planning + building.')
+
+  # PLAN a cell for it (live availability).
+  placement = plan_one_entry(claimed, provider, now)
+  if placement is None:
+    # Nothing placeable right now -> release the slot, back to QUEUED.
+    reason = claimed.last_reason or 'nothing placeable right now'
+    def _requeue(e: route_lib.QueueEntry) -> None:
+      e.state = route_lib.JobState.QUEUED
+      e.build_started_at = None
+      e.worker_id = None
+      e.last_reason = f'waiting: {reason}'
+    update_entry(queue_file, claimed.job_id, _requeue)
+    log.append(f'[worker] {claimed.job_id}: {reason}; released slot, back to QUEUED.')
+    return 'requeued', log, new_fail_count
+
+  # BUILD + SUBMIT: the one build. build_tpu_queue_cmd + submit(cwd=workdir).
+  argv = build_tpu_queue_cmd(placement, claimed, group)
+  log.append(f'[worker] building {claimed.job_id}: {placement.reason} '
+             f'(cwd={claimed.workdir or "router dir"})')
+  xid, out = submitter.submit(argv, cwd=claimed.workdir or '')
+
+  if xid:
+    def _submitted(e: route_lib.QueueEntry) -> None:
+      route_lib.apply_placement(e, placement, xid=xid, now=now)
+      e.build_started_at = None
+      e.worker_id = None
+    update_entry(queue_file, claimed.job_id, _submitted)
+    log.append(f'[worker] {claimed.job_id} -> SUBMITTED xid={xid} cell={placement.cell}')
+    return 'submitted', log, new_fail_count
+
+  # MODE-1 GUARD: no XID / found[] zombie -> NOT submitted. Back to QUEUED,
+  # count the attempt, keep the tail for diagnosis.
+  def _failed(e: route_lib.QueueEntry) -> None:
+    e.state = route_lib.JobState.QUEUED
+    e.build_started_at = None
+    e.worker_id = None
+    e.attempts += 1
+    e.last_reason = f'build produced no XID (found[]/crash?); will retry. {_tail(out)}'
+  update_entry(queue_file, claimed.job_id, _failed)
+  log.append(f'[worker] {claimed.job_id} -> NO XID (found[]/build crash); requeued. '
+             f'tail: {_tail(out)}')
+  return 'requeued', log, new_fail_count
+
+
+def run_worker_loop(
+    queue_file: str,
+    provider_factory: 'Callable[[], _Provider]',
+    submitter: _Submitter,
+    worker_id: str,
+    poll_s: float = 15.0,
+    build_stale_s: float = 1800.0,
+    group: str = DEFAULT_GROUP,
+    stage_probe: Optional[_StageHealthProbe] = None,
+    srcfs_fail_brake: int = 20,
+    max_iterations: Optional[int] = None,
+) -> None:
+  """The worker loop: run_worker_once forever, sleeping poll_s when idle/busy/
+  braked. `provider_factory` builds a fresh provider per build (one RPC each).
+  `max_iterations` bounds the loop for tests."""
+  last_fail = None
+  it = 0
+  while max_iterations is None or it < max_iterations:
+    it += 1
+    provider = provider_factory()
+    outcome, log, last_fail = run_worker_once(
+        queue_file, provider, submitter, now=time.time(), worker_id=worker_id,
+        build_stale_s=build_stale_s, group=group, stage_probe=stage_probe,
+        srcfs_fail_brake=srcfs_fail_brake, last_fail_count=last_fail)
+    for line in log:
+      print(line, flush=True)
+    # After a successful build, immediately try the next (drain fast); otherwise
+    # sleep so an empty/busy/braked queue does not spin.
+    if outcome not in ('submitted',):
+      time.sleep(poll_s)
+
+
 def main(argv):
   del argv
+
+  if _WORKER.value:
+    # SERIAL BUILD-WORKER loop. One build at a time, forever. This is the cure
+    # for concurrent-build failures (found[] zombies + CitC token exhaustion).
+    import socket
+    worker_id = f'{socket.gethostname()}:{os.getpid()}'
+    print(f'[worker] serial build-worker {worker_id} on {_QUEUE_FILE.value}; '
+          f'one build at a time, poll {_WORKER_POLL_S.value}s.', flush=True)
+    run_worker_loop(
+        _QUEUE_FILE.value,
+        provider_factory=lambda: avail_provider.AvailabilityProvider(group=_GROUP.value),
+        submitter=Submitter(),
+        worker_id=worker_id,
+        poll_s=_WORKER_POLL_S.value,
+        build_stale_s=_BUILD_STALE_S.value,
+        group=_GROUP.value,
+        srcfs_fail_brake=_SRCFS_FAIL_BRAKE.value,
+    )
+    return
+
   entries = load_queue(_QUEUE_FILE.value)
 
   if _REROUTE.value:

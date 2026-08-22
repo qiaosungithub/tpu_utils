@@ -338,5 +338,136 @@ class SubmitterCwdTest(unittest.TestCase):
     self.assertIn('workdir does not exist', out)
 
 
+class _StaleProbe:
+  """Scripted srcfs failure counter for the mode-2 brake test."""
+
+  def __init__(self, counts):
+    self._counts = list(counts)
+    self._i = 0
+
+  def failure_count(self):
+    v = self._counts[min(self._i, len(self._counts) - 1)]
+    self._i += 1
+    return v
+
+
+class SerialWorkerTest(unittest.TestCase):
+
+  def setUp(self):
+    self.path = tempfile.mkstemp(suffix='.json')[1]
+    self.addCleanup(lambda: os.path.exists(self.path) and os.remove(self.path))
+    lock = self.path + '.lock'
+    self.addCleanup(lambda: os.path.exists(lock) and os.remove(lock))
+
+  def _seed(self, entries):
+    RC.save_queue(self.path, entries)
+
+  def _load(self):
+    return RC.load_queue(self.path)
+
+  def _byid(self, jid):
+    return {e.job_id: e for e in self._load()}[jid]
+
+  def _prov(self, cell='yutulpz', arch='v7', free=320):
+    return _FakeProvider({f'{cell}|{arch}': _avail(cell, arch, free)},
+                         arch_price={arch: 20.0}, arch_pool={arch: free})
+
+  def test_claims_one_and_submits(self):
+    self._seed([_entry('a', power='v7-32', archs=('v7',))])
+    sub = _FakeSubmitter(xid='900')
+    outcome, log, _ = RC.run_worker_once(
+        self.path, self._prov(), sub, now=100.0, worker_id='w1')
+    self.assertEqual(outcome, 'submitted')
+    e = self._byid('a')
+    self.assertEqual(e.state, R.JobState.SUBMITTED)
+    self.assertEqual(e.xid, '900')
+    self.assertIsNone(e.build_started_at)         # slot released
+
+  def test_single_build_invariant_blocks_second_claim(self):
+    # one already BUILDING (live) + one QUEUED -> worker must NOT start a 2nd
+    e_bld = _entry('bld', power='v7-32', archs=('v7',))
+    e_bld.state = R.JobState.BUILDING
+    e_bld.build_started_at = 99.0
+    e_q = _entry('q', power='v7-32', archs=('v7',))
+    self._seed([e_bld, e_q])
+    sub = _FakeSubmitter(xid='901')
+    outcome, log, _ = RC.run_worker_once(
+        self.path, self._prov(), sub, now=100.0, worker_id='w2',
+        build_stale_s=1800.0)
+    self.assertEqual(outcome, 'busy')
+    self.assertEqual(sub.calls, [])               # nothing built
+    self.assertEqual(self._byid('q').state, R.JobState.QUEUED)  # still queued
+
+  def test_stale_building_is_reclaimed_then_claimed(self):
+    e_bld = _entry('old', power='v7-32', archs=('v7',))
+    e_bld.state = R.JobState.BUILDING
+    e_bld.build_started_at = 0.0                   # ancient
+    self._seed([e_bld])
+    sub = _FakeSubmitter(xid='902')
+    outcome, _, _ = RC.run_worker_once(
+        self.path, self._prov(), sub, now=5000.0, worker_id='w3',
+        build_stale_s=1800.0)
+    # stale claim reclaimed -> then the same entry (now QUEUED) is built
+    self.assertEqual(outcome, 'submitted')
+    self.assertEqual(self._byid('old').state, R.JobState.SUBMITTED)
+
+  def test_no_xid_requeues_not_submitted(self):
+    self._seed([_entry('z', power='v7-32', archs=('v7',))])
+    sub = _FakeSubmitter(xid=None)                 # found[]/build crash
+    outcome, log, _ = RC.run_worker_once(
+        self.path, self._prov(), sub, now=100.0, worker_id='w4')
+    self.assertEqual(outcome, 'requeued')
+    e = self._byid('z')
+    self.assertEqual(e.state, R.JobState.QUEUED)   # NOT submitted
+    self.assertEqual(e.attempts, 1)
+    self.assertIsNone(e.build_started_at)          # slot released
+
+  def test_nothing_placeable_requeues(self):
+    self._seed([_entry('p', power='v7-32', archs=('v7',))])
+    prov = _FakeProvider({'x|v7': _avail('x', 'v7', 320, oversold=True)},
+                         arch_price={'v7': 20.0}, arch_pool={'v7': 0})
+    sub = _FakeSubmitter(xid='903')
+    outcome, _, _ = RC.run_worker_once(
+        self.path, prov, sub, now=100.0, worker_id='w5')
+    self.assertEqual(outcome, 'requeued')
+    self.assertEqual(sub.calls, [])
+    self.assertEqual(self._byid('p').state, R.JobState.QUEUED)
+
+  def test_idle_when_empty(self):
+    self._seed([])
+    outcome, _, _ = RC.run_worker_once(
+        self.path, self._prov(), _FakeSubmitter(), now=0.0, worker_id='w6')
+    self.assertEqual(outcome, 'idle')
+
+  def test_srcfs_brake_skips_when_failures_spike(self):
+    self._seed([_entry('b', power='v7-32', archs=('v7',))])
+    sub = _FakeSubmitter(xid='904')
+    probe = _StaleProbe([100, 130])   # +30 between polls (>= 20 brake)
+    # first poll establishes baseline (100), no brake, builds
+    o1, _, fc1 = RC.run_worker_once(
+        self.path, self._prov(), sub, now=100.0, worker_id='w7',
+        stage_probe=probe, srcfs_fail_brake=20, last_fail_count=None)
+    self.assertEqual(o1, 'submitted')
+    # second poll sees +30 -> brake
+    self._seed([_entry('b2', power='v7-32', archs=('v7',))])
+    o2, log2, _ = RC.run_worker_once(
+        self.path, self._prov(), sub, now=200.0, worker_id='w7',
+        stage_probe=probe, srcfs_fail_brake=20, last_fail_count=fc1)
+    self.assertEqual(o2, 'braked')
+    self.assertTrue(any('BRAKE' in l for l in log2))
+
+  def test_worker_loop_bounded(self):
+    self._seed([_entry('a', power='v7-32', archs=('v7',)),
+                _entry('b', power='v7-32', archs=('v7',))])
+    sub = _FakeSubmitter(xid='905')
+    RC.run_worker_loop(
+        self.path, provider_factory=lambda: self._prov(),
+        submitter=sub, worker_id='wl', poll_s=0.0, max_iterations=2)
+    # both drained to SUBMITTED across 2 iterations (serial)
+    states = {e.job_id: e.state for e in self._load()}
+    self.assertEqual(states['a'], R.JobState.SUBMITTED)
+    self.assertEqual(states['b'], R.JobState.SUBMITTED)
+
+
 if __name__ == '__main__':
   unittest.main()

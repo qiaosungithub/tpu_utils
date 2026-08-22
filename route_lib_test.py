@@ -382,6 +382,70 @@ class TypeSelectionWeightTest(unittest.TestCase):
     self.assertEqual(p.arch, 'v6p')
 
 
+class SerialWorkerInvariantTest(unittest.TestCase):
+
+  def _q(self, job_id, state, **kw):
+    e = _entry(job_id)
+    e.state = state
+    for k, v in kw.items():
+      setattr(e, k, v)
+    return e
+
+  def test_count_building(self):
+    es = [self._q('a', R.JobState.QUEUED),
+          self._q('b', R.JobState.BUILDING, build_started_at=100.0),
+          self._q('c', R.JobState.SUBMITTED)]
+    self.assertEqual(R.count_building(es), 1)
+
+  def test_can_claim_false_when_live_build(self):
+    es = [self._q('b', R.JobState.BUILDING, build_started_at=100.0)]
+    self.assertFalse(R.can_claim_build(es, now=150.0, stale_after_s=1800.0))
+
+  def test_can_claim_true_when_build_is_stale(self):
+    es = [self._q('b', R.JobState.BUILDING, build_started_at=100.0)]
+    # 100 + 1800 = 1900 < 2000 -> stale, slot is free again
+    self.assertTrue(R.can_claim_build(es, now=2000.0, stale_after_s=1800.0))
+
+  def test_can_claim_true_when_none_building(self):
+    es = [self._q('a', R.JobState.QUEUED)]
+    self.assertTrue(R.can_claim_build(es, now=0.0, stale_after_s=1800.0))
+
+  def test_building_no_timestamp_is_stale(self):
+    e = self._q('b', R.JobState.BUILDING, build_started_at=None)
+    self.assertTrue(R.building_is_stale(e, now=0.0, stale_after_s=1800.0))
+
+  def test_reclaim_stale_building(self):
+    es = [self._q('b', R.JobState.BUILDING, build_started_at=0.0, worker_id='w1')]
+    reclaimed = R.reclaim_stale_building(es, now=2000.0, stale_after_s=1800.0)
+    self.assertEqual([e.job_id for e in reclaimed], ['b'])
+    self.assertEqual(es[0].state, R.JobState.QUEUED)
+    self.assertIsNone(es[0].build_started_at)
+    self.assertIsNone(es[0].worker_id)
+
+  def test_reclaim_leaves_live_building(self):
+    es = [self._q('b', R.JobState.BUILDING, build_started_at=1000.0)]
+    reclaimed = R.reclaim_stale_building(es, now=1100.0, stale_after_s=1800.0)
+    self.assertEqual(reclaimed, [])
+    self.assertEqual(es[0].state, R.JobState.BUILDING)
+
+  def test_next_queued_priority(self):
+    es = [self._q('lo', R.JobState.QUEUED, priority=1),
+          self._q('hi', R.JobState.QUEUED, priority=9),
+          self._q('bld', R.JobState.BUILDING, build_started_at=0.0)]
+    self.assertEqual(_ok(R.next_queued(es)).job_id, 'hi')
+
+  def test_next_queued_none_when_all_building_or_terminal(self):
+    es = [self._q('b', R.JobState.BUILDING, build_started_at=0.0),
+          self._q('d', R.JobState.DONE)]
+    self.assertIsNone(R.next_queued(es))
+
+  def test_claim_for_build_marks_and_stamps(self):
+    e = self._q('a', R.JobState.QUEUED)
+    R.claim_for_build(e, now=500.0, worker_id='w7')
+    self.assertEqual(e.state, R.JobState.BUILDING)
+    self.assertEqual(e.build_started_at, 500.0)
+    self.assertEqual(e.worker_id, 'w7')
+
 
 if __name__ == '__main__':
   unittest.main()

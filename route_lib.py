@@ -205,6 +205,7 @@ def effective_price(raw_price: float, pool_chips: float) -> float:
 class JobState(str, enum.Enum):
   """Lifecycle of a local-queue entry. Strings so the JSON file is readable."""
   QUEUED = 'QUEUED'        # waiting for the router to place it
+  BUILDING = 'BUILDING'    # a serial worker is running `tpu queue` for it NOW
   SUBMITTED = 'SUBMITTED'  # handed to XM, watching for RUNNING vs re-route
   RUNNING = 'RUNNING'      # confirmed running; the router is done with it
   DONE = 'DONE'            # finished (terminal)
@@ -255,6 +256,8 @@ class QueueEntry:
   arch: Optional[str] = None        # concrete arch chosen
   chips: Optional[int] = None       # concrete chip count chosen
   submitted_at: Optional[float] = None   # epoch when handed to XM
+  build_started_at: Optional[float] = None  # epoch a worker claimed it (BUILDING)
+  worker_id: Optional[str] = None   # which worker claimed it (BUILDING); for debug
   attempts: int = 0                 # placement attempts so far
   cooldown_cells: dict = dataclasses.field(default_factory=dict)  # cell -> until-epoch
   last_reason: str = ''             # why it is where it is (for status view)
@@ -552,3 +555,78 @@ def mark_reroute(entry: QueueEntry, now: float, cooldown_s: float) -> QueueEntry
   entry.submitted_at = None
   entry.attempts += 1
   return entry
+
+
+# --- serial build-worker invariant ----------------------------------------
+# The whole point of the worker: on THIS machine, two `tpu queue` builds that
+# share a checkout race on the blaze output_base (-> found[] zombie work units)
+# and a burst of concurrent stage-writes drains the CitC snapshot token bucket
+# (-> truncated stagedir, .par crash). Both are cured by never running two
+# builds at once. BUILDING is that lock, held IN the durable queue file so it
+# survives across worker restarts and is visible to `tpu queue-status`.
+
+def count_building(entries: list['QueueEntry']) -> int:
+  """How many entries are currently BUILDING. The serial invariant is that this
+  never exceeds 1; the worker checks it before claiming the next job."""
+  return sum(1 for e in entries if e.state == JobState.BUILDING)
+
+
+def building_is_stale(entry: QueueEntry, now: float, stale_after_s: float) -> bool:
+  """True if a BUILDING claim is older than stale_after_s -- i.e. the worker that
+  claimed it died mid-build (a build is minutes, never an hour). Such a claim
+  must be reclaimed or the queue wedges forever holding the single-build slot."""
+  if entry.state != JobState.BUILDING:
+    return False
+  started = entry.build_started_at
+  if started is None:
+    return True   # BUILDING with no timestamp is already corrupt -- reclaim it
+  return (now - started) >= stale_after_s
+
+
+def reclaim_stale_building(entries: list['QueueEntry'], now: float,
+                           stale_after_s: float) -> list['QueueEntry']:
+  """Reset any stale BUILDING entry back to QUEUED (worker crashed mid-build).
+  Returns the list of entries reclaimed. Frees the single-build slot."""
+  reclaimed = []
+  for e in entries:
+    if building_is_stale(e, now, stale_after_s):
+      e.state = JobState.QUEUED
+      e.build_started_at = None
+      e.worker_id = None
+      e.attempts += 1
+      e.last_reason = f'reclaimed: BUILDING claim went stale (>{int(stale_after_s)}s)'
+      reclaimed.append(e)
+  return reclaimed
+
+
+def next_queued(entries: list['QueueEntry']) -> Optional['QueueEntry']:
+  """The next QUEUED entry to build, highest priority first then FIFO-ish by
+  list order. Returns None if nothing is queued. Does NOT consider whether a
+  build is already in flight -- the caller enforces the single-build invariant."""
+  queued = [e for e in entries if e.state == JobState.QUEUED]
+  if not queued:
+    return None
+  # highest priority wins; ties keep insertion order (stable sort)
+  return max(queued, key=lambda e: e.priority) if len(queued) > 1 else queued[0]
+
+
+def claim_for_build(entry: QueueEntry, now: float, worker_id: str) -> QueueEntry:
+  """Mark an entry BUILDING (the worker is about to run `tpu queue` for it).
+  Records who claimed it and when, so a crashed claim can be detected as stale."""
+  entry.state = JobState.BUILDING
+  entry.build_started_at = now
+  entry.worker_id = worker_id
+  entry.last_reason = f'building (worker {worker_id})'
+  return entry
+
+
+def can_claim_build(entries: list['QueueEntry'], now: float,
+                    stale_after_s: float) -> bool:
+  """True iff the worker may start a new build: no LIVE (non-stale) BUILDING
+  entry holds the single-build slot. A stale claim does not count (it will be
+  reclaimed first). This is the serial invariant, enforced on the durable
+  queue so even two worker processes cannot both build at once."""
+  for e in entries:
+    if e.state == JobState.BUILDING and not building_is_stale(e, now, stale_after_s):
+      return False
+  return True
