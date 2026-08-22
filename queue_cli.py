@@ -17,6 +17,7 @@ route_check (queue persistence + a dry-run planning tick for the status view).
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 import uuid
@@ -63,6 +64,12 @@ _LAUNCH = flags.DEFINE_list(
     'launch', None, 'Extra args passed VERBATIM to `tpu queue` at submit time, '
     'as k=v pairs: --launch=config=cfg.py,skip_preflight,force. A bare token '
     'becomes a bare flag (--skip_preflight).')
+_WORKDIR = flags.DEFINE_string(
+    'workdir', None, 'Directory the router runs `tpu queue` FROM, i.e. the '
+    'checkout it packages into the stagedir. DEFAULTS to the current directory '
+    'at enqueue time -- so enqueue from the checkout whose source/config this '
+    "run needs. Only override if you know the source lives elsewhere. Pass ''"
+    'to force the router process dir (safe ONLY if every diff is a --flag).')
 
 
 def _parse_launch_kwargs(items: list[str] | None) -> dict:
@@ -93,6 +100,10 @@ def _cmd_enqueue(argv: list[str]) -> int:
     print(f'enqueue: job_id {job_id!r} already in the queue; pass a different '
           '--job_id.', file=sys.stderr)
     return 1
+  # workdir default = the CWD at enqueue time, so enqueuing from the right
+  # checkout just works. A flag value of '' explicitly opts into the router's
+  # own dir (only safe when every difference is an explicit --flag).
+  workdir = _WORKDIR.value if _WORKDIR.value is not None else os.getcwd()
   entry = route_lib.QueueEntry(
       job_id=job_id,
       power=_POWER.value,
@@ -104,6 +115,7 @@ def _cmd_enqueue(argv: list[str]) -> int:
       max_price=_MAX_PRICE.value,
       topology_locked=_TOPOLOGY_LOCKED.value,
       launch_kwargs=_parse_launch_kwargs(_LAUNCH.value),
+      workdir=workdir,
   )
   entries.append(entry)
   route_check.save_queue(_QUEUE_FILE.value, entries)
@@ -111,6 +123,7 @@ def _cmd_enqueue(argv: list[str]) -> int:
         f'tier={entry.tier} priority={entry.priority}'
         + (f' metros={entry.allowed_metros}' if entry.allowed_metros else '')
         + (' [topology-locked]' if entry.topology_locked else ''))
+  print(f'  packaged from: {entry.workdir or "(router process dir)"}')
   print(f'  queue now holds {len(entries)} job(s). See: tpu queue-status')
   return 0
 

@@ -71,7 +71,8 @@ class EnqueueDequeueTest(unittest.TestCase):
     with _FlagCtx(_QUEUE_FILE=self.path, _POWER='v7-32', _ARCHS=['v7', 'v6p'],
                   _TIER='PROD', _PRIORITY=5, _JOB_ID='j-a',
                   _LAUNCH=['config=cfg.py', 'force'], _METROS=None,
-                  _MAX_PRICE=None, _POWER_TOL=0.5, _TOPOLOGY_LOCKED=False):
+                  _MAX_PRICE=None, _POWER_TOL=0.5, _TOPOLOGY_LOCKED=False,
+                  _WORKDIR='/my/checkout'):
       rc = Q._cmd_enqueue(['queue_cli'])
     self.assertEqual(rc, 0)
     q = self._load()
@@ -82,7 +83,27 @@ class EnqueueDequeueTest(unittest.TestCase):
     self.assertEqual(e.allowed_archs, ['v7', 'v6p'])
     self.assertEqual(e.priority, 5)
     self.assertEqual(e.launch_kwargs, {'config': 'cfg.py', 'force': True})
+    self.assertEqual(e.workdir, '/my/checkout')       # explicit workdir kept
     self.assertEqual(e.state, R.JobState.QUEUED)
+
+  def test_enqueue_defaults_workdir_to_cwd(self):
+    # monitor v21 fix: enqueuing from the right checkout must capture it, so the
+    # router packages the correct source. Unset --workdir defaults to os.getcwd.
+    import os
+    with _FlagCtx(_QUEUE_FILE=self.path, _POWER='v7-32', _ARCHS=['v7'],
+                  _TIER='PROD', _PRIORITY=0, _JOB_ID='j-cwd', _LAUNCH=None,
+                  _METROS=None, _MAX_PRICE=None, _POWER_TOL=0.5,
+                  _TOPOLOGY_LOCKED=False, _WORKDIR=None):
+      Q._cmd_enqueue(['queue_cli'])
+    self.assertEqual(self._load()[0].workdir, os.getcwd())
+
+  def test_enqueue_empty_workdir_opts_into_router_dir(self):
+    with _FlagCtx(_QUEUE_FILE=self.path, _POWER='v7-32', _ARCHS=['v7'],
+                  _TIER='PROD', _PRIORITY=0, _JOB_ID='j-empty', _LAUNCH=None,
+                  _METROS=None, _MAX_PRICE=None, _POWER_TOL=0.5,
+                  _TOPOLOGY_LOCKED=False, _WORKDIR=''):
+      Q._cmd_enqueue(['queue_cli'])
+    self.assertEqual(self._load()[0].workdir, '')     # explicit '' preserved
 
   def test_enqueue_rejects_duplicate_job_id(self):
     common = dict(_QUEUE_FILE=self.path, _POWER='v7-32', _ARCHS=['v7'],

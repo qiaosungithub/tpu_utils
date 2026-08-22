@@ -240,6 +240,14 @@ class QueueEntry:
   topology_locked: bool = False
   locked_geometry: Optional[str] = None   # e.g. '2x4x4'; None until first placed
   launch_kwargs: dict = dataclasses.field(default_factory=dict)
+  # WORKDIR the submit runs `tpu queue` FROM. `tpu queue` rsyncs the source tree
+  # from its CWD into the stagedir, so a run whose config/edits live in a
+  # particular checkout (not passed via --config) MUST be packaged from that
+  # directory -- otherwise the router ships a copy of the WRONG source. Empty
+  # means "wherever the router process runs", which is only safe for a run whose
+  # every difference is passed as an explicit flag. `tpu enqueue` defaults this
+  # to the CWD at enqueue time, so enqueuing from the right checkout just works.
+  workdir: str = ''
   # ---- mutable state ----
   state: JobState = JobState.QUEUED
   xid: Optional[str] = None         # set once submitted

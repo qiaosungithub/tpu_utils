@@ -36,11 +36,13 @@ class _FakeSubmitter:
 
   def __init__(self, xid='555001'):
     self.calls = []
+    self.cwds = []
     self.cancels = []
     self._xid = xid
 
-  def submit(self, argv):
+  def submit(self, argv, cwd=''):
     self.calls.append(argv)
+    self.cwds.append(cwd)
     return self._xid, f'Launched experiment {self._xid}' if self._xid else 'no line'
 
   def cancel(self, xid):
@@ -154,6 +156,26 @@ class RunTickTest(unittest.TestCase):
     self.assertEqual(e.arch, 'v7')
     self.assertEqual(e.chips, 32)
     self.assertEqual(e.submitted_at, 100.0)
+
+  def test_workdir_is_passed_to_submitter_as_cwd(self):
+    # REGRESSION (monitor v21 field report): the router must package `tpu queue`
+    # from the job's OWN checkout, or a run whose config lives in a snapshot dir
+    # (not via --config) ships the wrong source. workdir must reach submit(cwd=).
+    e = _entry('j1', power='v7-32', archs=('v7',))
+    e.workdir = '/some/checkout/dir'
+    prov = _FakeProvider({'yutulpz|v7': _avail('yutulpz', 'v7', 320)},
+                         arch_price={'v7': 20.0}, arch_pool={'v7': 320})
+    sub = _FakeSubmitter(xid='777')
+    RC.run_tick([e], prov, now=0.0, submitter=sub, dry_run=False)
+    self.assertEqual(sub.cwds, ['/some/checkout/dir'])
+
+  def test_no_workdir_passes_empty_cwd(self):
+    e = _entry('j1', power='v7-32', archs=('v7',))   # workdir defaults to ''
+    prov = _FakeProvider({'yutulpz|v7': _avail('yutulpz', 'v7', 320)},
+                         arch_price={'v7': 20.0}, arch_pool={'v7': 320})
+    sub = _FakeSubmitter(xid='777')
+    RC.run_tick([e], prov, now=0.0, submitter=sub, dry_run=False)
+    self.assertEqual(sub.cwds, [''])                  # inherit router CWD
 
   def test_live_submit_no_xid_marks_failed_attempt(self):
     e = _entry('j1', power='v7-32', archs=('v7',))
@@ -302,6 +324,18 @@ class RunRerouteTest(unittest.TestCase):
     _, log = RC.run_reroute([e], now=10000.0, probe=probe,
                             submitter=_FakeSubmitter(), dry_run=False)
     self.assertTrue(any('no SUBMITTED job past' in l for l in log))
+
+
+class SubmitterCwdTest(unittest.TestCase):
+  """The real Submitter, exercised only on its input-validation path (no shell):
+  a non-existent workdir must be refused BEFORE any packaging happens."""
+
+  def test_nonexistent_workdir_refused(self):
+    sub = RC.Submitter()
+    xid, out = sub.submit(['tpu', 'queue', '--tpu_type=v7-32'],
+                          cwd='/no/such/checkout/dir')
+    self.assertIsNone(xid)
+    self.assertIn('workdir does not exist', out)
 
 
 if __name__ == '__main__':

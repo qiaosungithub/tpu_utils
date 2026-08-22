@@ -48,9 +48,9 @@ class _Provider(Protocol):
 
 class _Submitter(Protocol):
   """What run_tick needs to submit: shells out to `tpu queue` in production, a
-  recorder in tests."""
+  recorder in tests. `cwd` is the checkout `tpu queue` packages from."""
 
-  def submit(self, argv: list[str]) -> tuple[Optional[str], str]:
+  def submit(self, argv: list[str], cwd: str = '') -> tuple[Optional[str], str]:
     ...
 
   def cancel(self, xid: str) -> tuple[bool, str]:
@@ -189,13 +189,21 @@ class Submitter:
     self.wrapper_path = wrapper_path
     self.timeout_s = timeout_s
 
-  def submit(self, argv: list[str]) -> tuple[Optional[str], str]:
+  def submit(self, argv: list[str], cwd: str = '') -> tuple[Optional[str], str]:
     # argv[0] is 'tpu' (a shell function); build a sourced-shell command.
+    # `cwd` is where `tpu queue` runs, hence what its rsync packages -- it MUST
+    # be the job's own checkout or the wrong source is shipped. Empty = inherit
+    # the router's CWD (only safe when every difference rides on an explicit
+    # flag). A non-existent cwd is refused up front rather than silently
+    # packaging whatever the fallback directory happens to be.
     inner = ' '.join(_shquote(a) for a in argv)
     script = f'source {_shquote(self.wrapper_path)} >/dev/null 2>&1; {inner}'
+    run_cwd = cwd or None
+    if run_cwd is not None and not os.path.isdir(run_cwd):
+      return None, f'[route_check] refusing to submit: workdir does not exist: {run_cwd}'
     try:
       proc = subprocess.run(['bash', '-c', script], capture_output=True,
-                            text=True, timeout=self.timeout_s)
+                            text=True, timeout=self.timeout_s, cwd=run_cwd)
     except subprocess.TimeoutExpired as e:
       return None, f'[route_check] tpu queue TIMED OUT after {self.timeout_s}s: {e}'
     out = (proc.stdout or '') + (proc.stderr or '')
@@ -380,17 +388,19 @@ def run_tick(
     entry = by_id.get(p.job_id)
     if entry is None:
       continue
+    workdir = entry.workdir or ''
+    cwd_note = f'  (cwd={workdir})' if workdir else '  (cwd=router process dir -- config must be via --flag)'
     if dry_run:
       argv = build_tpu_queue_cmd(p, entry, group)
       log.append(f'[DRY] would place {p.job_id}: {p.reason}')
-      log.append(f'      cmd: {" ".join(argv)}')
+      log.append(f'      cmd: {" ".join(argv)}{cwd_note}')
       continue
     # live submit
     sub = submitter or Submitter()
     argv = build_tpu_queue_cmd(p, entry, group)
     log.append(f'[route_check] placing {p.job_id}: {p.reason}')
-    log.append(f'      cmd: {" ".join(argv)}')
-    xid, out = sub.submit(argv)
+    log.append(f'      cmd: {" ".join(argv)}{cwd_note}')
+    xid, out = sub.submit(argv, cwd=workdir)
     if xid:
       route_lib.apply_placement(entry, p, xid=xid, now=now)
       log.append(f'      -> SUBMITTED xid={xid} cell={p.cell}')
