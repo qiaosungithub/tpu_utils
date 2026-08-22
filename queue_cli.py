@@ -153,6 +153,31 @@ def _cmd_dequeue(argv: list[str]) -> int:
   return 0
 
 
+def _cmd_requeue(argv: list[str]) -> int:
+  """Return HELD job(s) to QUEUED after the operator has fixed the cause. With
+  no id, requeues ALL held jobs."""
+  ids = set()
+  if _JOB_ID.value:
+    ids |= {x.strip() for x in _JOB_ID.value.split(',')}
+  ids |= {a for a in argv[1:] if not a.startswith('-')}
+  entries = route_check.load_queue(_QUEUE_FILE.value)
+  held = [e for e in entries if e.state == route_lib.JobState.HELD]
+  if not held:
+    print('requeue: no HELD jobs.', file=sys.stderr)
+    return 1
+  targets = [e for e in held if (not ids or e.job_id in ids)]
+  if not targets:
+    print(f'requeue: none of {sorted(ids)} are HELD. Held: '
+          f'{[e.job_id for e in held]}', file=sys.stderr)
+    return 1
+  for e in targets:
+    route_lib.requeue_held(e)
+    print(f'requeued {e.job_id} (HELD -> QUEUED)')
+  route_check.save_queue(_QUEUE_FILE.value, entries)
+  print(f'  {len(targets)} job(s) back in the queue.')
+  return 0
+
+
 # ANSI helpers for the status board.
 def _c(code: str, s: str) -> str:
   return f'\x1b[{code}m{s}\x1b[0m'
@@ -203,6 +228,9 @@ def _cmd_status(argv: list[str]) -> int:
     elif e.state == route_lib.JobState.BUILDING:
       why = _c('35', f'building now (worker {e.worker_id or "?"}): {e.last_reason}')
       state_disp = _c('1;35', e.state.value)
+    elif e.state == route_lib.JobState.HELD:
+      why = _c('31', f'{e.last_reason}  -> fix + `tpu enqueue` again, or `tpu queue-status` after re-enqueue')
+      state_disp = _c('1;31', e.state.value)
     elif e.state == route_lib.JobState.SUBMITTED:
       why = f'xid={e.xid} cell={e.cell} {e.arch}-{e.chips}; {e.last_reason}'
       state_disp = _c('34', e.state.value)
@@ -234,8 +262,10 @@ def main(argv):
     return _cmd_status(rest)
   if cmd in ('dequeue', 'remove', 'rm'):
     return _cmd_dequeue(rest)
-  print(f'unknown subcommand {cmd!r}; expected enqueue|queue-status|dequeue',
-        file=sys.stderr)
+  if cmd in ('requeue', 'unhold'):
+    return _cmd_requeue(rest)
+  print(f'unknown subcommand {cmd!r}; expected '
+        'enqueue|queue-status|dequeue|requeue', file=sys.stderr)
   return 2
 
 

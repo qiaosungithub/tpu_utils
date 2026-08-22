@@ -116,6 +116,10 @@ _SRCFS_FAIL_BRAKE = flags.DEFINE_integer(
     'srcfs_fail_brake', 20, 'If this many NEW srcfs/CreateSnapshot failures '
     'appear between two polls, skip claiming a build this round (the CitC token '
     'bucket is draining). 0 disables the brake.')
+_MAX_BUILD_ATTEMPTS = flags.DEFINE_integer(
+    'max_build_attempts', 3, 'After this many failed build attempts a job is '
+    'moved to HELD instead of requeued forever, so one bad job cannot churn the '
+    'worker and starve the rest. A human re-enqueues it once fixed.')
 
 
 # --- queue persistence (atomic, flock'd, like ~/.tpu_jobs.json) -----------
@@ -529,11 +533,13 @@ def run_worker_once(
     stage_probe: Optional[_StageHealthProbe] = None,
     srcfs_fail_brake: int = 20,
     last_fail_count: Optional[int] = None,
+    max_build_attempts: int = 3,
 ) -> tuple[str, list[str], Optional[int]]:
   """One worker step. Returns (outcome, log_lines, new_fail_count).
 
   outcome is one of: 'submitted', 'requeued', 'idle' (nothing to build),
-  'busy' (a build already in flight), 'braked' (srcfs failures spiking).
+  'busy' (a build already in flight), 'braked' (srcfs failures spiking),
+  'held' (the claimed job cannot build as-is and was parked, not churned).
 
   The single-build invariant is enforced by claim_next_build (atomic, flock'd):
   at most one entry is BUILDING across all worker processes. This step claims
@@ -568,6 +574,18 @@ def run_worker_once(
 
   log.append(f'[worker] claimed {claimed.job_id} (BUILDING); planning + building.')
 
+  # WORKDIR GUARD: a set-but-nonexistent workdir would package the wrong source
+  # (or fail). Do NOT churn on it -- park it in HELD for a human to re-enqueue.
+  # An EMPTY workdir is allowed here (it may be a flag-only run); if it turns out
+  # to be unbuildable it is caught by the max-attempts HOLD below, not guessed at.
+  if claimed.workdir and not os.path.isdir(claimed.workdir):
+    reason = f'workdir does not exist: {claimed.workdir} -- re-enqueue from a valid checkout'
+    def _hold_bad_workdir(e: route_lib.QueueEntry) -> None:
+      route_lib.hold_entry(e, reason)
+    update_entry(queue_file, claimed.job_id, _hold_bad_workdir)
+    log.append(f'[worker] {claimed.job_id} -> HELD ({reason}); slot released, not churned.')
+    return 'held', log, new_fail_count
+
   # PLAN a cell for it (live availability).
   placement = plan_one_entry(claimed, provider, now)
   if placement is None:
@@ -597,17 +615,32 @@ def run_worker_once(
     log.append(f'[worker] {claimed.job_id} -> SUBMITTED xid={xid} cell={placement.cell}')
     return 'submitted', log, new_fail_count
 
-  # MODE-1 GUARD: no XID / found[] zombie -> NOT submitted. Back to QUEUED,
-  # count the attempt, keep the tail for diagnosis.
+  # MODE-1 GUARD: no XID / found[] zombie -> NOT submitted. Count the attempt.
+  # Requeue for a retry UNLESS it has now failed max_build_attempts times, in
+  # which case park it in HELD so one bad job cannot churn the worker forever
+  # and starve the rest of the queue (an unattended worker must self-limit).
+  attempts_after = claimed.attempts + 1
+  if attempts_after >= max_build_attempts:
+    reason = (f'build produced no XID after {attempts_after} attempts '
+              f'(found[]/crash?); parked. Last: {_tail(out)}')
+    def _held(e: route_lib.QueueEntry) -> None:
+      e.attempts = attempts_after
+      route_lib.hold_entry(e, reason)
+    update_entry(queue_file, claimed.job_id, _held)
+    log.append(f'[worker] {claimed.job_id} -> HELD after {attempts_after} failed '
+               f'attempts; not churning. tail: {_tail(out)}')
+    return 'held', log, new_fail_count
+
   def _failed(e: route_lib.QueueEntry) -> None:
     e.state = route_lib.JobState.QUEUED
     e.build_started_at = None
     e.worker_id = None
-    e.attempts += 1
-    e.last_reason = f'build produced no XID (found[]/crash?); will retry. {_tail(out)}'
+    e.attempts = attempts_after
+    e.last_reason = (f'build produced no XID (found[]/crash?); retry '
+                     f'{attempts_after}/{max_build_attempts}. {_tail(out)}')
   update_entry(queue_file, claimed.job_id, _failed)
-  log.append(f'[worker] {claimed.job_id} -> NO XID (found[]/build crash); requeued. '
-             f'tail: {_tail(out)}')
+  log.append(f'[worker] {claimed.job_id} -> NO XID (found[]/build crash); requeued '
+             f'({attempts_after}/{max_build_attempts}). tail: {_tail(out)}')
   return 'requeued', log, new_fail_count
 
 
@@ -621,6 +654,7 @@ def run_worker_loop(
     group: str = DEFAULT_GROUP,
     stage_probe: Optional[_StageHealthProbe] = None,
     srcfs_fail_brake: int = 20,
+    max_build_attempts: int = 3,
     max_iterations: Optional[int] = None,
 ) -> None:
   """The worker loop: run_worker_once forever, sleeping poll_s when idle/busy/
@@ -634,7 +668,8 @@ def run_worker_loop(
     outcome, log, last_fail = run_worker_once(
         queue_file, provider, submitter, now=time.time(), worker_id=worker_id,
         build_stale_s=build_stale_s, group=group, stage_probe=stage_probe,
-        srcfs_fail_brake=srcfs_fail_brake, last_fail_count=last_fail)
+        srcfs_fail_brake=srcfs_fail_brake, last_fail_count=last_fail,
+        max_build_attempts=max_build_attempts)
     for line in log:
       print(line, flush=True)
     # After a successful build, immediately try the next (drain fast); otherwise
@@ -662,6 +697,7 @@ def main(argv):
         build_stale_s=_BUILD_STALE_S.value,
         group=_GROUP.value,
         srcfs_fail_brake=_SRCFS_FAIL_BRAKE.value,
+        max_build_attempts=_MAX_BUILD_ATTEMPTS.value,
     )
     return
 

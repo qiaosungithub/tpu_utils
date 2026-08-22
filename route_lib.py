@@ -206,6 +206,9 @@ class JobState(str, enum.Enum):
   """Lifecycle of a local-queue entry. Strings so the JSON file is readable."""
   QUEUED = 'QUEUED'        # waiting for the router to place it
   BUILDING = 'BUILDING'    # a serial worker is running `tpu queue` for it NOW
+  HELD = 'HELD'            # parked: cannot build as-is (bad workdir / too many
+                           # failed attempts). NOT picked by the worker until a
+                           # human fixes it (re-enqueue) -- prevents churn.
   SUBMITTED = 'SUBMITTED'  # handed to XM, watching for RUNNING vs re-route
   RUNNING = 'RUNNING'      # confirmed running; the router is done with it
   DONE = 'DONE'            # finished (terminal)
@@ -630,3 +633,30 @@ def can_claim_build(entries: list['QueueEntry'], now: float,
     if e.state == JobState.BUILDING and not building_is_stale(e, now, stale_after_s):
       return False
   return True
+
+
+# --- HELD: park a job that cannot build as-is, instead of churning ----------
+# An unattended serial worker must not spin on a bad job. Two causes park a job
+# in HELD (skipped by next_queued until a human re-enqueues): a workdir that is
+# set but does not exist (definitely broken -- the wrong source would be
+# packaged or the build fails), and too many failed build attempts (the
+# empty-workdir-that-fails case, caught without guessing whether the config is
+# flag-resolvable). HELD is recoverable, not terminal.
+
+def hold_entry(entry: QueueEntry, reason: str) -> QueueEntry:
+  """Park an entry in HELD with a human-readable reason. Frees the build slot."""
+  entry.state = JobState.HELD
+  entry.build_started_at = None
+  entry.worker_id = None
+  entry.last_reason = f'HELD: {reason}'
+  return entry
+
+
+def requeue_held(entry: QueueEntry) -> QueueEntry:
+  """Return a HELD entry to QUEUED (a human fixed it / wants a retry). Resets the
+  attempt counter so it gets a fresh run of tries."""
+  if entry.state == JobState.HELD:
+    entry.state = JobState.QUEUED
+    entry.attempts = 0
+    entry.last_reason = 'requeued from HELD'
+  return entry

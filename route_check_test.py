@@ -468,6 +468,51 @@ class SerialWorkerTest(unittest.TestCase):
     self.assertEqual(states['a'], R.JobState.SUBMITTED)
     self.assertEqual(states['b'], R.JobState.SUBMITTED)
 
+  def test_nonexistent_workdir_is_HELD_not_churned(self):
+    e = _entry('bad', power='v7-32', archs=('v7',))
+    e.workdir = '/no/such/checkout/xyz'
+    self._seed([e])
+    sub = _FakeSubmitter(xid='906')
+    outcome, log, _ = RC.run_worker_once(
+        self.path, self._prov(), sub, now=100.0, worker_id='w')
+    self.assertEqual(outcome, 'held')
+    self.assertEqual(sub.calls, [])                 # never built
+    self.assertEqual(self._byid('bad').state, R.JobState.HELD)
+
+  def test_HELD_job_is_not_claimed_again(self):
+    # a HELD job must be skipped; a QUEUED sibling is built instead
+    e_held = _entry('held', power='v7-32', archs=('v7',))
+    e_held.state = R.JobState.HELD
+    e_ok = _entry('ok', power='v7-32', archs=('v7',))
+    self._seed([e_held, e_ok])
+    sub = _FakeSubmitter(xid='907')
+    outcome, _, _ = RC.run_worker_once(
+        self.path, self._prov(), sub, now=100.0, worker_id='w')
+    self.assertEqual(outcome, 'submitted')
+    self.assertEqual(self._byid('ok').state, R.JobState.SUBMITTED)
+    self.assertEqual(self._byid('held').state, R.JobState.HELD)  # untouched
+
+  def test_max_attempts_moves_to_HELD_not_infinite_requeue(self):
+    e = _entry('z', power='v7-32', archs=('v7',))
+    self._seed([e])
+    sub = _FakeSubmitter(xid=None)                  # every build fails (no XID)
+    # attempts: 0->1 (requeue), 1->2 (requeue), 2->3 (>=3 -> HELD)
+    for expected in ('requeued', 'requeued', 'held'):
+      o, _, _ = RC.run_worker_once(
+          self.path, self._prov(), sub, now=100.0, worker_id='w',
+          max_build_attempts=3)
+      self.assertEqual(o, expected)
+    self.assertEqual(self._byid('z').state, R.JobState.HELD)
+    self.assertEqual(self._byid('z').attempts, 3)
+
+  def test_requeue_held_via_helper(self):
+    e = _entry('h', power='v7-32', archs=('v7',))
+    e.state = R.JobState.HELD
+    e.attempts = 5
+    R.requeue_held(e)
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual(e.attempts, 0)
+
 
 if __name__ == '__main__':
   unittest.main()
