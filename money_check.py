@@ -17,9 +17,12 @@ import ast
 # ResourceType ids come from //depot/google3/third_party/py/xmanager/xm/resources.py.
 # GHOSTFISHLITE (101) is v7 and gets its own row -- it used to be folded into
 # the v6p entry, which silently merged two different generations' prices.
+# v5e (viperlite_pod, 62/60) is intentionally OMITTED from the rendered board:
+# the team does not run on it and its row was pure noise. market.json still
+# carries every card the spanner fetch returns (dump_market_json uses the raw
+# prices, not this list), so dropping it here changes only the display.
 TARGET_CARDS = [
     ("TPU v4", "tpu_pufferfish", [34]),
-    ("TPU v5e", "tpu_viperlite_pod", [62, 60]),
     ("TPU v5p", "tpu_viperfish", [59]),
     ("TPU v6e", "tpu_ghostlite_pod", [76, 63]),
     ("TPU v6p", "tpu_ghostfish", [92]),
