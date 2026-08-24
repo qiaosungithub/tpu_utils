@@ -72,6 +72,101 @@ class QueuePersistenceTest(unittest.TestCase):
     self.assertEqual(RC.load_queue('/no/such/queue.json'), [])
 
 
+class ConcurrentWriteTest(unittest.TestCase):
+  """The concurrency bug: a route tick that load...RPC...save'd the WHOLE queue
+  clobbered rows enqueued during the RPC window. These tests pin the fix
+  (merge_and_save_touched + the queue lock) and include a negative control that
+  the naive whole-overwrite still loses the row -- so the test can actually fail.
+  """
+
+  def _queue_path(self):
+    path = tempfile.mkstemp(suffix='.json')[1]
+    self.addCleanup(os.remove, path)
+    # Clean up the sidecar lockfile too.
+    self.addCleanup(lambda: os.path.exists(path + '.lock') and
+                    os.remove(path + '.lock'))
+    return path
+
+  def test_merge_preserves_concurrently_enqueued_row(self):
+    # The exact scenario: a tick snapshots the queue (holding [a]), an enqueue
+    # lands [a, b] during the RPC window, then the tick writes back its touched
+    # copy of [a]. With merge_and_save_touched, b MUST survive.
+    path = self._queue_path()
+    RC.save_queue(path, [_entry('a', priority=6)])
+    snapshot = RC.load_queue(path)            # tick's in-memory snapshot: [a]
+    # ... concurrent enqueue lands during the (simulated) RPC window ...
+    with RC.with_queue_lock(path):
+      live = RC.load_queue(path)
+      live.append(_entry('b', priority=0))
+      RC.save_queue(path, live)               # queue now [a, b]
+    # ... tick finishes and merge-writes its touched snapshot ([a] mutated) ...
+    snapshot[0].last_reason = 'routed this tick'
+    RC.merge_and_save_touched(path, snapshot)
+    back = {e.job_id: e for e in RC.load_queue(path)}
+    self.assertIn('b', back, 'concurrently enqueued row was clobbered')
+    self.assertIn('a', back)
+    self.assertEqual(back['a'].last_reason, 'routed this tick',
+                     'touched row must carry the tick mutation')
+    self.assertEqual(back['b'].priority, 0)
+
+  def test_negative_control_whole_overwrite_loses_row(self):
+    # Prove the test is real: the OLD pattern (whole-queue save of the stale
+    # snapshot) DOES drop the concurrently enqueued row.
+    path = self._queue_path()
+    RC.save_queue(path, [_entry('a', priority=6)])
+    snapshot = RC.load_queue(path)            # [a]
+    with RC.with_queue_lock(path):
+      live = RC.load_queue(path)
+      live.append(_entry('b', priority=0))
+      RC.save_queue(path, live)               # [a, b]
+    RC.save_queue(path, snapshot)             # OLD BUG: overwrite with stale [a]
+    back = {e.job_id: e for e in RC.load_queue(path)}
+    self.assertNotIn('b', back,
+                     'negative control should reproduce the clobber')
+
+  def test_merge_drops_removed_ids(self):
+    path = self._queue_path()
+    RC.save_queue(path, [_entry('a'), _entry('b'), _entry('c')])
+    entries = RC.load_queue(path)
+    RC.merge_and_save_touched(path, entries, dropped_job_ids={'b'})
+    self.assertEqual([e.job_id for e in RC.load_queue(path)], ['a', 'c'])
+
+  def test_concurrent_enqueue_processes_lose_nothing(self):
+    # The real acceptance test: fork N processes that each enqueue a distinct id
+    # concurrently, while a route-tick-style merge runs in the parent. Every
+    # enqueued id must be present at the end -- 0 lost.
+    import multiprocessing
+    path = self._queue_path()
+    RC.save_queue(path, [_entry('seed', priority=9)])
+
+    n = 12
+
+    def _enqueuer(i):
+      with RC.with_queue_lock(path):
+        entries = RC.load_queue(path)
+        entries.append(_entry(f'job{i}', priority=0))
+        RC.save_queue(path, entries)
+
+    procs = [multiprocessing.Process(target=_enqueuer, args=(i,))
+             for i in range(n)]
+    for p in procs:
+      p.start()
+    # Meanwhile the parent runs several route-tick-style merge-writes on stale
+    # snapshots -- exactly the operation that used to clobber enqueues.
+    for _ in range(5):
+      snap = RC.load_queue(path)
+      for e in snap:
+        e.last_reason = 'tick'
+      RC.merge_and_save_touched(path, snap)
+    for p in procs:
+      p.join(timeout=30)
+    got = {e.job_id for e in RC.load_queue(path)}
+    missing = {f'job{i}' for i in range(n)} - got
+    self.assertEqual(missing, set(),
+                     f'{len(missing)} concurrently enqueued rows were lost')
+    self.assertIn('seed', got)
+
+
 class BuildCmdTest(unittest.TestCase):
 
   def test_basic_shape(self):

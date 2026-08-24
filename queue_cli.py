@@ -94,12 +94,7 @@ def _cmd_enqueue(argv: list[str]) -> int:
           '  e.g. tpu enqueue --power=v7-32 --archs=v7,v6p '
           '--launch=config=configs/eqr.py', file=sys.stderr)
     return 2
-  entries = route_check.load_queue(_QUEUE_FILE.value)
   job_id = _JOB_ID.value or _new_job_id(_POWER.value)
-  if any(e.job_id == job_id for e in entries):
-    print(f'enqueue: job_id {job_id!r} already in the queue; pass a different '
-          '--job_id.', file=sys.stderr)
-    return 1
   # workdir default = the CWD at enqueue time, so enqueuing from the right
   # checkout just works. A flag value of '' explicitly opts into the router's
   # own dir (only safe when every difference is an explicit --flag).
@@ -117,8 +112,18 @@ def _cmd_enqueue(argv: list[str]) -> int:
       launch_kwargs=_parse_launch_kwargs(_LAUNCH.value),
       workdir=workdir,
   )
-  entries.append(entry)
-  route_check.save_queue(_QUEUE_FILE.value, entries)
+  # The whole read-modify-write runs under the queue lock: load the LIVE queue,
+  # check for a duplicate id, append, save -- atomically. Loading outside the
+  # lock (the old bug) let a concurrent route tick's whole-queue overwrite land
+  # between our load and save and silently drop this freshly enqueued row.
+  with route_check.with_queue_lock(_QUEUE_FILE.value):
+    entries = route_check.load_queue(_QUEUE_FILE.value)
+    if any(e.job_id == job_id for e in entries):
+      print(f'enqueue: job_id {job_id!r} already in the queue; pass a different '
+            '--job_id.', file=sys.stderr)
+      return 1
+    entries.append(entry)
+    route_check.save_queue(_QUEUE_FILE.value, entries)
   print(f'enqueued {job_id}: power={entry.power} archs={entry.allowed_archs} '
         f'tier={entry.tier} priority={entry.priority}'
         + (f' metros={entry.allowed_metros}' if entry.allowed_metros else '')
@@ -137,13 +142,14 @@ def _cmd_dequeue(argv: list[str]) -> int:
     print('dequeue: pass job_id(s): tpu dequeue <job_id> [<job_id> ...]',
           file=sys.stderr)
     return 2
-  entries = route_check.load_queue(_QUEUE_FILE.value)
-  keep = [e for e in entries if e.job_id not in ids]
-  removed = [e.job_id for e in entries if e.job_id in ids]
-  if not removed:
-    print(f'dequeue: none of {sorted(ids)} found in the queue.', file=sys.stderr)
-    return 1
-  route_check.save_queue(_QUEUE_FILE.value, keep)
+  with route_check.with_queue_lock(_QUEUE_FILE.value):
+    entries = route_check.load_queue(_QUEUE_FILE.value)
+    keep = [e for e in entries if e.job_id not in ids]
+    removed = [e.job_id for e in entries if e.job_id in ids]
+    if not removed:
+      print(f'dequeue: none of {sorted(ids)} found in the queue.', file=sys.stderr)
+      return 1
+    route_check.save_queue(_QUEUE_FILE.value, keep)
   for r in removed:
     print(f'dequeued {r}')
   missing = ids - set(removed)
@@ -160,20 +166,21 @@ def _cmd_requeue(argv: list[str]) -> int:
   if _JOB_ID.value:
     ids |= {x.strip() for x in _JOB_ID.value.split(',')}
   ids |= {a for a in argv[1:] if not a.startswith('-')}
-  entries = route_check.load_queue(_QUEUE_FILE.value)
-  held = [e for e in entries if e.state == route_lib.JobState.HELD]
-  if not held:
-    print('requeue: no HELD jobs.', file=sys.stderr)
-    return 1
-  targets = [e for e in held if (not ids or e.job_id in ids)]
-  if not targets:
-    print(f'requeue: none of {sorted(ids)} are HELD. Held: '
-          f'{[e.job_id for e in held]}', file=sys.stderr)
-    return 1
-  for e in targets:
-    route_lib.requeue_held(e)
-    print(f'requeued {e.job_id} (HELD -> QUEUED)')
-  route_check.save_queue(_QUEUE_FILE.value, entries)
+  with route_check.with_queue_lock(_QUEUE_FILE.value):
+    entries = route_check.load_queue(_QUEUE_FILE.value)
+    held = [e for e in entries if e.state == route_lib.JobState.HELD]
+    if not held:
+      print('requeue: no HELD jobs.', file=sys.stderr)
+      return 1
+    targets = [e for e in held if (not ids or e.job_id in ids)]
+    if not targets:
+      print(f'requeue: none of {sorted(ids)} are HELD. Held: '
+            f'{[e.job_id for e in held]}', file=sys.stderr)
+      return 1
+    for e in targets:
+      route_lib.requeue_held(e)
+      print(f'requeued {e.job_id} (HELD -> QUEUED)')
+    route_check.save_queue(_QUEUE_FILE.value, entries)
   print(f'  {len(targets)} job(s) back in the queue.')
   return 0
 

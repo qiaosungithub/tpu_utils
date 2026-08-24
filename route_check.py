@@ -21,6 +21,7 @@ default is dry-run so a first live run shows the plan before touching XM.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import fcntl
 import json
@@ -191,6 +192,76 @@ def _lockfile(path: str) -> str:
   return f'{path}.lock'
 
 
+@contextlib.contextmanager
+def with_queue_lock(path: str):
+  """Hold the cross-process exclusive lock on the queue's sidecar lockfile for
+  the whole `with` block.
+
+  Every read-modify-write of the queue MUST happen inside this block so that a
+  load...mutate...save is atomic against other processes. The old pattern --
+  load_queue() then (much later) save_queue() as two separate calls -- each took
+  the lock only briefly, leaving a wide window in which another writer's save
+  clobbered entries added in between. That window is exactly how a `tpu enqueue`
+  landing during a slow route tick vanished: the tick wrote back its stale
+  in-memory snapshot over the freshly enqueued row.
+
+  The lock is a SEPARATE sidecar file ('{path}.lock'), never the queue file
+  itself, because save_queue swaps the queue in via os.replace -- a lock taken
+  on the queue inode would be lost at the rename. load_queue/save_queue take no
+  lock of their own; callers serialize through this manager (or the higher-level
+  helpers below that wrap it).
+  """
+  lock_path = _lockfile(path)
+  with open(lock_path, 'w') as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+      yield
+    finally:
+      fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def merge_and_save_touched(
+    path: str,
+    touched: list[route_lib.QueueEntry],
+    dropped_job_ids: Optional[set] = None,
+) -> None:
+  """Re-load the queue under the lock and write back only the entries this pass
+  actually changed, keyed by job_id, then persist atomically.
+
+  This is the write half of the route pass fix. The slow part of a tick (the
+  RPCs in run_tick/run_reroute) runs on an in-memory snapshot WITHOUT the lock,
+  so enqueue is never blocked for minutes. Only the fast merge-write is locked:
+  we re-read the live queue (which may now contain rows enqueued during the
+  RPCs), overwrite just the job_ids we touched with our updated copies, drop any
+  the pass removed, and leave every other row -- including newly enqueued ones
+  -- exactly as found. So a concurrent enqueue can no longer be clobbered by a
+  tick writing back a stale whole-queue snapshot.
+
+  Ordering: preserve the live queue's order for rows that already existed;
+  append touched rows that are new (shouldn't happen for route, but harmless).
+  """
+  touched_by_id = {e.job_id: e for e in touched}
+  dropped = dropped_job_ids or set()
+  with with_queue_lock(path):
+    live = load_queue(path)
+    merged: list[route_lib.QueueEntry] = []
+    seen = set()
+    for e in live:
+      if e.job_id in dropped:
+        seen.add(e.job_id)
+        continue
+      if e.job_id in touched_by_id:
+        merged.append(touched_by_id[e.job_id])
+      else:
+        merged.append(e)
+      seen.add(e.job_id)
+    # Touched rows that were not in the live queue (newly created by the pass).
+    for e in touched:
+      if e.job_id not in seen:
+        merged.append(e)
+    save_queue(path, merged)
+
+
 def claim_next_build(path: str, now: float, worker_id: str,
                      stale_after_s: float) -> Optional[route_lib.QueueEntry]:
   """Atomically: reclaim stale BUILDING, then IF no live build is in flight,
@@ -198,24 +269,19 @@ def claim_next_build(path: str, now: float, worker_id: str,
   (a copy reflecting the persisted state) or None if nothing was claimed
   (queue empty, or a build already in flight). Serialized by an exclusive
   flock held across the whole read-modify-write."""
-  lock_path = _lockfile(path)
-  with open(lock_path, 'w') as lock:
-    fcntl.flock(lock, fcntl.LOCK_EX)
-    try:
-      entries = load_queue(path)
-      route_lib.reclaim_stale_building(entries, now, stale_after_s)
-      if not route_lib.can_claim_build(entries, now, stale_after_s):
-        save_queue(path, entries)   # persist any reclaim even if we don't claim
-        return None
-      nxt = route_lib.next_queued(entries)
-      if nxt is None:
-        save_queue(path, entries)
-        return None
-      route_lib.claim_for_build(nxt, now, worker_id)
+  with with_queue_lock(path):
+    entries = load_queue(path)
+    route_lib.reclaim_stale_building(entries, now, stale_after_s)
+    if not route_lib.can_claim_build(entries, now, stale_after_s):
+      save_queue(path, entries)   # persist any reclaim even if we don't claim
+      return None
+    nxt = route_lib.next_queued(entries)
+    if nxt is None:
       save_queue(path, entries)
-      return nxt
-    finally:
-      fcntl.flock(lock, fcntl.LOCK_UN)
+      return None
+    route_lib.claim_for_build(nxt, now, worker_id)
+    save_queue(path, entries)
+    return nxt
 
 
 def update_entry(path: str, job_id: str,
@@ -223,22 +289,17 @@ def update_entry(path: str, job_id: str,
   """Atomically apply `mutate` to the entry with `job_id` and persist. Returns
   True if the entry was found. Used to write the post-build result (SUBMITTED,
   or back to QUEUED) without clobbering concurrent edits to other entries."""
-  lock_path = _lockfile(path)
-  with open(lock_path, 'w') as lock:
-    fcntl.flock(lock, fcntl.LOCK_EX)
-    try:
-      entries = load_queue(path)
-      found = False
-      for e in entries:
-        if e.job_id == job_id:
-          mutate(e)
-          found = True
-          break
-      if found:
-        save_queue(path, entries)
-      return found
-    finally:
-      fcntl.flock(lock, fcntl.LOCK_UN)
+  with with_queue_lock(path):
+    entries = load_queue(path)
+    found = False
+    for e in entries:
+      if e.job_id == job_id:
+        mutate(e)
+        found = True
+        break
+    if found:
+      save_queue(path, entries)
+    return found
 
 
 # --- pure helpers ---------------------------------------------------------
@@ -841,6 +902,12 @@ def main(argv):
     )
     return
 
+  # Read an unlocked SNAPSHOT for the pass. The slow work below (status/avail
+  # RPCs, cancel/submit, the confirm-gap sleep) runs on this snapshot WITHOUT
+  # holding the queue lock, so a concurrent `tpu enqueue` is never blocked for
+  # the minutes a tick can take. The lock is taken only for the fast merge-write
+  # at the end (merge_and_save_touched), which re-reads the live queue and folds
+  # our changes back in by job_id -- so rows enqueued during the RPCs survive.
   entries = load_queue(_QUEUE_FILE.value)
 
   if _REROUTE.value:
@@ -862,7 +929,11 @@ def main(argv):
   for line in log:
     print(line)
   if not _DRY_RUN.value:
-    save_queue(_QUEUE_FILE.value, updated)
+    # Merge-write instead of a whole-queue overwrite: fold only the rows this
+    # pass touched back into the live queue, preserving anything enqueued while
+    # the RPCs ran. Neither run_tick nor run_reroute removes entries (they only
+    # mutate state in place), so there are no dropped_job_ids to pass.
+    merge_and_save_touched(_QUEUE_FILE.value, updated)
     print(f'[route_check] queue saved to {_QUEUE_FILE.value}')
   else:
     print('[route_check] DRY RUN -- queue not modified. Pass --nodry_run to act.')
