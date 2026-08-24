@@ -101,6 +101,13 @@ _DRY_RUN = flags.DEFINE_bool(
     'dry_run', True, 'Plan only; do NOT submit. Default True -- pass '
     '--nodry_run to actually submit.')
 _GROUP = flags.DEFINE_string('group', DEFAULT_GROUP, 'Alloc group for submits.')
+_GROUP_ORDER = flags.DEFINE_string(
+    'group_order', None,
+    'Comma-separated alloc groups to TRY IN ORDER for placement, e.g. "5,9": '
+    'prefer the cheaper/free vqfree pool (g5) and only fall back to the g9 floor '
+    'for jobs g5 cannot place this tick. Each group is tried with its own live '
+    'availability; a job placed under an earlier group is no longer QUEUED so '
+    'later groups only see the remainder. None = single-group behaviour (--group).')
 _MAX_PLACEMENTS = flags.DEFINE_integer(
     'max_placements', None, 'Cap placements this tick (None = no cap).')
 _VERBOSE = flags.DEFINE_bool('verbose', True, 'Print per-job planning detail.')
@@ -919,12 +926,33 @@ def main(argv):
         confirm_gap_s=_CONFIRM_GAP_S.value,
         fresh_output_s=_FRESH_OUTPUT_S.value)
   else:
-    # Drain QUEUED jobs into the XM queue.
-    provider = avail_provider.AvailabilityProvider(group=_GROUP.value)
-    updated, log = run_tick(
-        entries, provider, now=time.time(),
-        dry_run=_DRY_RUN.value, group=_GROUP.value,
-        max_placements=_MAX_PLACEMENTS.value, verbose=_VERBOSE.value)
+    # Drain QUEUED jobs into the XM queue, trying groups IN PREFERENCE ORDER.
+    # `--group_order=5,9` places what the free vqfree pool (g5) can take first
+    # and only lets the remainder fall through to the g9 floor -- so we lean on
+    # borrowed/free capacity before spending the paid floor. Each group is a
+    # normal run_tick against ITS OWN live availability; a job placed under an
+    # earlier group is no longer QUEUED, so the next group's tick only sees what
+    # is left. With no --group_order this is exactly the old single-group tick.
+    group_order = (
+        [g.strip() for g in _GROUP_ORDER.value.split(',') if g.strip()]
+        if _GROUP_ORDER.value else [_GROUP.value])
+    log = []
+    updated = entries
+    for gi, grp in enumerate(group_order):
+      remaining = [e for e in updated if e.state == route_lib.JobState.QUEUED]
+      if not remaining and gi > 0:
+        log.append(f'[route_check] all jobs placed before group {grp}; '
+                   f'skipping remaining groups.')
+        break
+      if len(group_order) > 1:
+        log.append(f'[route_check] === placement pass under group {grp} '
+                   f'({gi + 1}/{len(group_order)}) ===')
+      provider = avail_provider.AvailabilityProvider(group=grp)
+      updated, tick_log = run_tick(
+          updated, provider, now=time.time(),
+          dry_run=_DRY_RUN.value, group=grp,
+          max_placements=_MAX_PLACEMENTS.value, verbose=_VERBOSE.value)
+      log.extend(tick_log)
 
   for line in log:
     print(line)

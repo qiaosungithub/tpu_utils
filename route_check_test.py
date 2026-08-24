@@ -714,5 +714,76 @@ class SerialWorkerTest(unittest.TestCase):
     self.assertEqual(e.attempts, 0)
 
 
+class GroupOrderTest(unittest.TestCase):
+  """The place pass tries groups in preference order (e.g. vqfree g5 then g9).
+
+  The loop in _run applies run_tick once per group, each with that group's own
+  availability; a job placed by an earlier group is SUBMITTED and the next
+  group's tick only sees the QUEUED remainder. These tests pin that composition
+  invariant (which is what --group_order relies on) at the run_tick level.
+  """
+
+  def _run_group_order(self, entries, providers_by_group, group_order):
+    """Mirror _run's place loop: sequential run_tick per group, live submit."""
+    submitters = {}
+    updated = entries
+    for grp in group_order:
+      remaining = [e for e in updated if e.state == R.JobState.QUEUED]
+      if not remaining:
+        break
+      sub = _FakeSubmitter(xid=f'xid-{grp}')
+      submitters[grp] = sub
+      updated, _ = RC.run_tick(
+          updated, providers_by_group[grp], now=100.0, submitter=sub,
+          dry_run=False, group=grp)
+    return updated, submitters
+
+  def test_prefers_first_group_when_it_can_place(self):
+    # A job placeable in BOTH g5 and g9 must be taken by g5 (tried first); g9
+    # must never see it.
+    e = _entry('j1', power='v7-32', archs=('v7',))
+    prov5 = _FakeProvider({'yutulpz|v7': _avail('yutulpz', 'v7', 320)},
+                          arch_price={'v7': 20.0}, arch_pool={'v7': 320})
+    prov9 = _FakeProvider({'yudfwra|v7': _avail('yudfwra', 'v7', 320)},
+                          arch_price={'v7': 20.0}, arch_pool={'v7': 320})
+    _out, subs = self._run_group_order(
+        [e], {'5': prov5, '9': prov9}, ['5', '9'])
+    self.assertEqual(len(subs['5'].calls), 1, 'g5 should place the job')
+    self.assertNotIn('9', subs, 'g9 tick should be skipped: nothing left QUEUED')
+    self.assertEqual(e.state, R.JobState.SUBMITTED)
+    self.assertEqual(e.xid, 'xid-5')
+
+  def test_falls_back_to_second_group_when_first_cannot_place(self):
+    # g5 has NO availability; the job must fall through to g9.
+    e = _entry('j1', power='v7-32', archs=('v7',))
+    prov5 = _FakeProvider({})  # vqfree empty this tick
+    prov9 = _FakeProvider({'yudfwra|v7': _avail('yudfwra', 'v7', 320)},
+                          arch_price={'v7': 20.0}, arch_pool={'v7': 320})
+    _out, subs = self._run_group_order(
+        [e], {'5': prov5, '9': prov9}, ['5', '9'])
+    self.assertEqual(subs['5'].calls, [], 'g5 cannot place (no avail)')
+    self.assertEqual(len(subs['9'].calls), 1, 'g9 should place the fallback')
+    self.assertEqual(e.state, R.JobState.SUBMITTED)
+    self.assertEqual(e.xid, 'xid-9')
+
+  def test_split_batch_partly_g5_partly_g9(self):
+    # Two jobs, g5 can seat only one slice; the other must fall to g9. Neither
+    # is lost, neither double-placed.
+    e1 = _entry('j1', power='v7-32', archs=('v7',))
+    e2 = _entry('j2', power='v7-32', archs=('v7',))
+    prov5 = _FakeProvider({'yutulpz|v7': _avail('yutulpz', 'v7', 32)},
+                          arch_price={'v7': 20.0}, arch_pool={'v7': 32})
+    prov9 = _FakeProvider({'yudfwra|v7': _avail('yudfwra', 'v7', 320)},
+                          arch_price={'v7': 20.0}, arch_pool={'v7': 320})
+    out, subs = self._run_group_order(
+        [e1, e2], {'5': prov5, '9': prov9}, ['5', '9'])
+    placed_g5 = sum(len(subs[g].calls) for g in subs if g == '5')
+    placed_g9 = sum(len(subs[g].calls) for g in subs if g == '9')
+    self.assertEqual(placed_g5, 1, 'g5 seats exactly one slice')
+    self.assertEqual(placed_g9, 1, 'the other falls to g9')
+    self.assertTrue(all(e.state == R.JobState.SUBMITTED for e in out))
+    self.assertEqual({e.xid for e in out}, {'xid-5', 'xid-9'})
+
+
 if __name__ == '__main__':
   unittest.main()
