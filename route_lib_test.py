@@ -213,6 +213,43 @@ class RerouteTest(unittest.TestCase):
     p = _ok(R.plan_one(e, avail, now=800.0))
     self.assertEqual(p.cell, 'yukulwh')      # avoided the cooled-down cell
 
+  # --- hardening pure logic (2026-08-24) ---
+  def test_output_is_fresh_within_window(self):
+    self.assertTrue(R.output_is_fresh(latest_mtime=640.0, now=700.0,
+                                      fresh_within_s=1200.0))   # 60s ago
+
+  def test_output_is_fresh_none_means_no_evidence(self):
+    self.assertFalse(R.output_is_fresh(latest_mtime=None, now=700.0,
+                                       fresh_within_s=1200.0))  # missing = not alive
+
+  def test_output_is_fresh_boundary_is_stale(self):
+    # EXACTLY fresh_within_s ago counts as stale, so the window can never make
+    # reroute a permanent no-op.
+    self.assertFalse(R.output_is_fresh(latest_mtime=800.0, now=2000.0,
+                                       fresh_within_s=1200.0))  # 1200s ago == boundary
+    self.assertTrue(R.output_is_fresh(latest_mtime=801.0, now=2000.0,
+                                      fresh_within_s=1200.0))   # 1199s ago < window
+
+  def test_decide_reroute_both_pending_no_output_reroutes(self):
+    self.assertTrue(R.decide_reroute('PENDING', 'PENDING', output_fresh=False))
+
+  def test_decide_reroute_fresh_output_blocks(self):
+    self.assertFalse(R.decide_reroute('PENDING', 'PENDING', output_fresh=True))
+
+  def test_decide_reroute_second_running_blocks(self):
+    self.assertFalse(R.decide_reroute('PENDING', 'RUNNING', output_fresh=False))
+
+  def test_decide_reroute_second_unknown_blocks(self):
+    # ambiguity protects: never cancel on a second UNKNOWN.
+    self.assertFalse(R.decide_reroute('PENDING', 'UNKNOWN', output_fresh=False))
+
+  def test_decide_reroute_first_not_pending_never_reroutes(self):
+    self.assertFalse(R.decide_reroute('RUNNING', None, output_fresh=False))
+    self.assertFalse(R.decide_reroute('TERMINAL', None, output_fresh=False))
+
+  def test_decide_reroute_none_second_is_defensive_noop(self):
+    self.assertFalse(R.decide_reroute('PENDING', None, output_fresh=False))
+
 
 class SerdeTest(unittest.TestCase):
 

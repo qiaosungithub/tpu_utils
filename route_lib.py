@@ -543,6 +543,59 @@ def needs_reroute(entry: QueueEntry, now: float, reroute_after_s: float) -> bool
   return (now - entry.submitted_at) >= reroute_after_s
 
 
+def output_is_fresh(latest_mtime: Optional[float], now: float,
+                    fresh_within_s: float) -> bool:
+  """True if the job's output dir shows a write within `fresh_within_s` of now.
+
+  A job that is writing checkpoints/metrics RIGHT NOW is alive, whatever a
+  single XManager snapshot momentarily says. This is the disk-evidence guard
+  that stops a BATCH job -- whose EMA shadow work-units run in segments, so the
+  XM layer can read `all pending` in the gap between two segments -- from being
+  re-routed while it is in fact training (xid 282605596, 2026-08-24: XM showed
+  all-pending in a shadow gap, but pass@2=0.5025 had just been written).
+
+  Pure: the caller does the CNS stat and passes the newest mtime in (or None if
+  the dir is missing / the stat failed -- in which case there is NO evidence of
+  life here and we fall back to the two-sample probe, never judging alive on a
+  failed lookup). Boundary is exclusive-of-stale: a write EXACTLY fresh_within_s
+  ago is treated as stale (not fresh), so the deadline cannot make reroute a
+  no-op."""
+  if latest_mtime is None:
+    return False
+  return (now - latest_mtime) < fresh_within_s
+
+
+def decide_reroute(first_state: str, second_state: Optional[str],
+                   output_fresh: bool,
+                   pending_const: str = 'PENDING') -> bool:
+  """Pure decision: should this candidate ACTUALLY be re-routed?
+
+  The safety invariant: this only ever returns True when EVERY guard has failed
+  to find life. It never widens the reroute path -- each guard can only turn a
+  would-be reroute OFF.
+
+    1. first_state != PENDING  -> not reroute (RUNNING/TERMINAL/UNKNOWN handled
+       by the caller's own branches; we never reroute a non-PENDING first read).
+    2. output_fresh            -> not reroute (disk says it is alive NOW).
+    3. second_state != PENDING -> not reroute (the shadow-gap cleared on the
+       second sample; UNKNOWN also protects -- never cancel on ambiguity).
+    4. both PENDING and no fresh output -> RE-ROUTE (double-confirmed stuck).
+
+  `second_state` is None when the caller has not taken a second sample (e.g. the
+  first read was already non-PENDING, or output was fresh so we short-circuited);
+  in that case guards 1/2 must have decided, and reaching here with None means
+  'do not reroute' (defensive)."""
+  if first_state != pending_const:
+    return False
+  if output_fresh:
+    return False
+  if second_state is None:
+    return False
+  if second_state != pending_const:
+    return False
+  return True
+
+
 def mark_reroute(entry: QueueEntry, now: float, cooldown_s: float) -> QueueEntry:
   """Return the entry reset to QUEUED after a failed placement, with the cell
   it was stuck in put on cooldown so the next plan avoids it for a while."""

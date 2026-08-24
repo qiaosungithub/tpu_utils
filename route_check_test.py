@@ -262,7 +262,8 @@ class RunRerouteTest(unittest.TestCase):
     probe = _FakeProbe({'111': RC.STATUS_PENDING})
     sub = _FakeSubmitter()
     RC.run_reroute([e], now=700.0, probe=probe, submitter=sub,
-                   reroute_after_s=600.0, cooldown_s=1800.0, dry_run=False)
+                   reroute_after_s=600.0, cooldown_s=1800.0, dry_run=False,
+                   sleep_fn=lambda _: None)
     self.assertEqual(sub.cancels, ['111'])               # cancelled
     self.assertEqual(e.state, R.JobState.QUEUED)         # back to queue
     self.assertIsNone(e.xid)
@@ -273,7 +274,8 @@ class RunRerouteTest(unittest.TestCase):
     probe = _FakeProbe({'111': RC.STATUS_PENDING})
     sub = _FakeSubmitter()
     _, log = RC.run_reroute([e], now=700.0, probe=probe, submitter=sub,
-                            reroute_after_s=600.0, dry_run=True)
+                            reroute_after_s=600.0, dry_run=True,
+                            sleep_fn=lambda _: None)
     self.assertEqual(sub.cancels, [])
     self.assertEqual(e.state, R.JobState.SUBMITTED)      # untouched
     self.assertTrue(any('[DRY][reroute]' in l for l in log))
@@ -314,7 +316,7 @@ class RunRerouteTest(unittest.TestCase):
         return False, 'xmanager stop failed'
     sub = _FailCancel()
     RC.run_reroute([e], now=700.0, probe=probe, submitter=sub,
-                   reroute_after_s=600.0, dry_run=False)
+                   reroute_after_s=600.0, dry_run=False, sleep_fn=lambda _: None)
     self.assertEqual(sub.cancels, ['111'])
     self.assertEqual(e.state, R.JobState.SUBMITTED)      # not re-queued on failure
 
@@ -324,6 +326,109 @@ class RunRerouteTest(unittest.TestCase):
     _, log = RC.run_reroute([e], now=10000.0, probe=probe,
                             submitter=_FakeSubmitter(), dry_run=False)
     self.assertTrue(any('no SUBMITTED job past' in l for l in log))
+
+
+class _SeqProbe:
+  """Returns a scripted SEQUENCE of STATUS_* per xid, one per call -- so a test
+  can make the first probe PENDING and the second RUNNING (the shadow gap)."""
+
+  def __init__(self, seq_by_xid):
+    self._seq = {k: list(v) for k, v in seq_by_xid.items()}
+    self.calls = {}
+
+  def status(self, xid):
+    self.calls[xid] = self.calls.get(xid, 0) + 1
+    seq = self._seq.get(xid, [])
+    if not seq:
+      return RC.STATUS_UNKNOWN
+    return seq.pop(0) if len(seq) > 1 else seq[0]  # last value sticks
+
+
+class _FakeOutputProbe:
+  """Returns a scripted latest_mtime per xid (or None = no disk evidence)."""
+
+  def __init__(self, mtime_by_xid):
+    self._by_xid = mtime_by_xid
+
+  def latest_mtime(self, entry):
+    return self._by_xid.get(entry.xid)
+
+
+class RerouteHardeningTest(unittest.TestCase):
+  """The 2026-08-24 guards: a single PENDING snapshot must not cancel a job that
+  is actually alive (BATCH EMA shadow-WU gap -- xid 282605596)."""
+
+  def _no_sleep(self, _):
+    pass
+
+  def test_shadow_gap_second_probe_running_is_not_rerouted(self):
+    # First probe PENDING (caught in a shadow gap), second probe RUNNING.
+    e = _submitted('j1', '111', 'yutulpz', submitted_at=0.0)
+    probe = _SeqProbe({'111': [RC.STATUS_PENDING, RC.STATUS_RUNNING]})
+    sub = _FakeSubmitter()
+    _, log = RC.run_reroute([e], now=700.0, probe=probe, submitter=sub,
+                            reroute_after_s=600.0, dry_run=False,
+                            output_probe=_FakeOutputProbe({}),  # no disk evidence
+                            confirm_gap_s=15.0, sleep_fn=self._no_sleep)
+    self.assertEqual(sub.cancels, [])                    # NOT cancelled
+    self.assertEqual(e.state, R.JobState.SUBMITTED)
+    self.assertEqual(probe.calls['111'], 2)              # took the 2nd sample
+    self.assertTrue(any('2nd probe' in l for l in log))
+
+  def test_fresh_output_is_not_rerouted_even_if_pending(self):
+    # Both probes would say PENDING, but disk shows a write 60s ago -> alive.
+    e = _submitted('j1', '222', 'yutulpz', submitted_at=0.0)
+    probe = _SeqProbe({'222': [RC.STATUS_PENDING, RC.STATUS_PENDING]})
+    sub = _FakeSubmitter()
+    _, log = RC.run_reroute([e], now=700.0, probe=probe, submitter=sub,
+                            reroute_after_s=600.0, dry_run=False,
+                            output_probe=_FakeOutputProbe({'222': 640.0}),  # 60s ago
+                            fresh_output_s=1200.0, sleep_fn=self._no_sleep)
+    self.assertEqual(sub.cancels, [])                    # NOT cancelled
+    self.assertEqual(e.state, R.JobState.SUBMITTED)
+    self.assertEqual(probe.calls['222'], 1)              # short-circuited before 2nd probe
+    self.assertTrue(any('FRESH output' in l for l in log))
+
+  def test_both_pending_no_fresh_output_is_rerouted(self):
+    # The genuine stuck case: two PENDING samples, stale output -> DO reroute.
+    e = _submitted('j1', '333', 'yutulpz', submitted_at=0.0)
+    probe = _SeqProbe({'333': [RC.STATUS_PENDING, RC.STATUS_PENDING]})
+    sub = _FakeSubmitter()
+    RC.run_reroute([e], now=700.0, probe=probe, submitter=sub,
+                   reroute_after_s=600.0, cooldown_s=1800.0, dry_run=False,
+                   output_probe=_FakeOutputProbe({'333': None}),  # no output
+                   confirm_gap_s=15.0, sleep_fn=self._no_sleep)
+    self.assertEqual(sub.cancels, ['333'])               # cancelled (correct)
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertIsNone(e.xid)
+
+  def test_boundary_stale_output_plus_second_pending_still_reroutes(self):
+    # v26 edge: output mtime EXACTLY at the freshness boundary (=stale) AND the
+    # second probe also PENDING -> must STILL reroute (guards near-miss, not a
+    # permanent shield). fresh_output_s=1200, write was exactly 1200s ago.
+    e = _submitted('j1', '444', 'yutulpz', submitted_at=0.0)
+    probe = _SeqProbe({'444': [RC.STATUS_PENDING, RC.STATUS_PENDING]})
+    sub = _FakeSubmitter()
+    RC.run_reroute([e], now=2000.0, probe=probe, submitter=sub,
+                   reroute_after_s=600.0, cooldown_s=1800.0, dry_run=False,
+                   output_probe=_FakeOutputProbe({'444': 800.0}),  # 1200s ago == boundary
+                   fresh_output_s=1200.0, confirm_gap_s=15.0,
+                   sleep_fn=self._no_sleep)
+    self.assertEqual(sub.cancels, ['444'])               # boundary=stale -> reroute
+    self.assertEqual(e.state, R.JobState.QUEUED)
+
+  def test_terminal_zombie_cleanup_unaffected_by_hardening(self):
+    # v26 req 2: TERMINAL->FAILED path must NOT go through the new guards.
+    e = _submitted('j1', '555', 'yutulpz', submitted_at=0.0)
+    probe = _SeqProbe({'555': [RC.STATUS_TERMINAL]})
+    sub = _FakeSubmitter()
+    RC.run_reroute([e], now=700.0, probe=probe, submitter=sub,
+                   reroute_after_s=600.0, dry_run=False,
+                   output_probe=_FakeOutputProbe({'555': 690.0}),  # even fresh output
+                   sleep_fn=self._no_sleep)
+    self.assertEqual(sub.cancels, [])
+    self.assertEqual(e.state, R.JobState.FAILED)         # zombie still cleaned
+    self.assertEqual(probe.calls['555'], 1)              # no 2nd probe for TERMINAL
 
 
 class SubmitterCwdTest(unittest.TestCase):

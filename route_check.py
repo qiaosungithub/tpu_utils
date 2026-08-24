@@ -72,6 +72,16 @@ class _StatusProbe(Protocol):
     ...
 
 
+class _OutputProbe(Protocol):
+  """Returns the newest mtime (epoch seconds) under a job's output dir, or None
+  if the dir is missing / the lookup failed. Backed by a CNS listing in
+  production, scripted in tests. A None NEVER means 'alive' -- it means 'no disk
+  evidence', so the caller falls back to the two-sample probe."""
+
+  def latest_mtime(self, entry: 'route_lib.QueueEntry') -> Optional[float]:
+    ...
+
+
 DEFAULT_QUEUE_FILE = os.path.expanduser('~/.tpu_local_queue.json')
 # The wrapper defining the `tpu` shell function; we source it, then call `tpu`.
 TPU_WRAPPER = os.path.expanduser('~/work/tpu_cmd/tpu_wrapper.sh')
@@ -103,6 +113,15 @@ _REROUTE_AFTER_S = flags.DEFINE_float(
 _COOLDOWN_S = flags.DEFINE_float(
     'cooldown_s', 1800.0, 'After a re-route, avoid the stuck cell for this long '
     'so the job does not bounce straight back into it.')
+_CONFIRM_GAP_S = flags.DEFINE_float(
+    'reroute_confirm_gap_s', 15.0, 'Before cancelling a PENDING job, wait this '
+    'long and re-probe; only cancel if STILL pending. Clears BATCH shadow-WU '
+    'gaps that momentarily read all-pending.')
+_FRESH_OUTPUT_S = flags.DEFINE_float(
+    'reroute_fresh_output_s', 1200.0, 'A job whose output dir was written within '
+    'this many seconds is judged ALIVE and never re-routed, whatever XManager '
+    'says (disk evidence beats a PENDING snapshot). Default 20 min > a BATCH '
+    'work-unit segment.')
 _WORKER = flags.DEFINE_bool(
     'worker', False, 'Run as the SERIAL build-worker loop: claim one QUEUED job '
     'at a time as BUILDING, run `tpu queue` for it, record the result, repeat. '
@@ -364,6 +383,82 @@ class XManagerStatusProbe:
     return STATUS_RUNNING
 
 
+def _parse_fileutil_mtime(fields: list[str]) -> Optional[float]:
+  """Epoch seconds from a `fileutil ls -l` row's date+time, or None.
+
+  A row is like `-rw-rw---- 1 user group 15909 2026/08/24 01:49:01 <path>`.
+  User/group spacing varies, so we scan for the `YYYY/MM/DD` token and take the
+  `HH:MM:SS` right after it. Local time (fileutil prints local), so mktime.
+  """
+  for i, tok in enumerate(fields):
+    if len(tok) == 10 and tok[4] == '/' and tok[7] == '/' and i + 1 < len(fields):
+      stamp = f'{tok} {fields[i + 1]}'
+      try:
+        return time.mktime(time.strptime(stamp, '%Y/%m/%d %H:%M:%S'))
+      except ValueError:
+        return None
+  return None
+
+
+class CnsOutputProbe:
+  """Newest mtime of ANY file under a job's XID-prefixed output dir on CNS.
+
+  A job that is placed and running writes rank/task logs (rank_0_attempt3.log,
+  stdout, ...) LONG before its first final metric. So 'alive' must mean 'any
+  output file written recently', NOT just the final arc_metrics -- a young eval
+  arm that has placed, restarted an attempt, and is streaming rank logs but has
+  not emitted metric #1 yet is very much alive (xid 282682357, 2026-08-24: rank
+  logs writing every few seconds, zero final metrics, borg RUNNING).
+
+  XID-prefixed dirs live at `<bucket>/logs/<project>/xid_<xid>_<ts>_<name>`, so
+  we glob `<bucket>/logs/*/xid_<xid>_*` and take the newest mtime across the
+  whole tree (`ls -l -R`). fileutil has no `--format`, so we parse its default
+  `-l` output: columns `... <date> <time> <path>` (date/time are fields 6/7).
+
+  Any failure (no bucket/XID, fileutil error/timeout, nothing matched, no
+  parseable row) returns None = 'no disk evidence' -- the caller then falls
+  back to the two-sample probe. We NEVER fabricate a recent time on error, so a
+  broken lookup can only make reroute MORE careful, never keep a dead job alive.
+  """
+
+  def __init__(self, timeout_s: float = 20.0):
+    self._timeout_s = timeout_s
+
+  def latest_mtime(self, entry: 'route_lib.QueueEntry') -> Optional[float]:
+    xid = entry.xid
+    bucket = (entry.launch_kwargs or {}).get('bucket')
+    if not xid or not bucket:
+      return None
+    # XID-prefixed dir: <bucket>/logs/<project>/xid_<xid>_*  (fileutil ** does
+    # NOT recurse across levels, so name the levels explicitly). -R then walks
+    # the whole subtree so we see the newest rank/task log, not just top-level.
+    pattern = f'{bucket.rstrip("/")}/logs/*/xid_{xid}_*'
+    try:
+      out = subprocess.run(
+          ['fileutil', 'ls', '-l', '-R', pattern],
+          capture_output=True, text=True, timeout=self._timeout_s)
+    except (subprocess.TimeoutExpired, OSError):
+      return None
+    if out.returncode != 0 or not out.stdout.strip():
+      return None
+    newest: Optional[float] = None
+    for line in out.stdout.splitlines():
+      # Default `-l` row: '<perms> <n> <user> <group> <size> <YYYY/MM/DD> '
+      # '<HH:MM:SS> <path>'. Directories (perms start 'd') carry the dir's own
+      # mtime too -- fine, a fresh file bumps its dir. Parse date+time fields.
+      fields = line.split()
+      if len(fields) < 8 or fields[0].startswith('total'):
+        continue
+      # find the 'YYYY/MM/DD' 'HH:MM:SS' pair (fields 5,6 in 0-index for files;
+      # be robust to user/group spacing by scanning for the date-shaped token).
+      mt = _parse_fileutil_mtime(fields)
+      if mt is None:
+        continue
+      if newest is None or mt > newest:
+        newest = mt
+    return newest
+
+
 # --- the re-route sweep ---------------------------------------------------
 def run_reroute(
     entries: list[route_lib.QueueEntry],
@@ -373,15 +468,32 @@ def run_reroute(
     reroute_after_s: float = 600.0,
     cooldown_s: float = 1800.0,
     dry_run: bool = True,
+    output_probe: Optional[_OutputProbe] = None,
+    confirm_gap_s: float = 15.0,
+    fresh_output_s: float = 1200.0,
+    sleep_fn: Callable[[float], None] = time.sleep,
 ) -> tuple[list[route_lib.QueueEntry], list[str]]:
   """Cancel SUBMITTED jobs stuck PENDING past the deadline and return them to
   QUEUED for the next tick to re-place. Returns (entries, log_lines).
 
   The clock rule lives in route_lib.needs_reroute; here we add the live check
-  (only cancel a job the probe CONFIRMS is still pending -- never on UNKNOWN)
   and the side effects (cancel + mark_reroute, which cools the stuck cell). A
   job that has meanwhile started RUNNING is promoted; a terminal one is left for
   infra_check to reconcile.
+
+  HARDENING (2026-08-24, after xid 282605596 was wrongly re-routed): a single
+  PENDING snapshot is NOT enough to cancel -- a BATCH job's EMA shadow work
+  units run in segments, so XManager can read `all pending` in the gap between
+  two segments while the job is in fact training. Before cancelling a job the
+  first probe called PENDING, we now require BOTH:
+    (a) no fresh output on disk -- output_probe.latest_mtime within
+        fresh_output_s means it is writing NOW, so it is alive; AND
+    (b) a SECOND probe, taken confirm_gap_s later, also PENDING -- the shadow
+        gap clears on the second sample.
+  Only if both guards still say 'stuck' do we cancel (route_lib.decide_reroute
+  owns this pure decision). Every guard can only turn a would-be reroute OFF;
+  the reroute path is never widened. The RUNNING/TERMINAL/UNKNOWN branches --
+  including the zombie TERMINAL->FAILED cleanup -- are unchanged.
   """
   log: list[str] = []
   candidates = [e for e in entries
@@ -397,8 +509,36 @@ def run_reroute(
     state = probe.status(xid) if xid else STATUS_UNKNOWN
     tag = f'{e.job_id} (xid={xid}, {e.cell}, pending {age}s)'
     if state == STATUS_PENDING and xid:
+      # GUARD (a): disk evidence of life. A fresh write beats a PENDING snapshot.
+      mtime = output_probe.latest_mtime(e) if output_probe else None
+      out_fresh = route_lib.output_is_fresh(mtime, now, fresh_output_s)
+      if out_fresh:
+        age_out = int(now - mtime) if mtime else -1
+        e.last_reason = f'alive: output written {age_out}s ago (not re-routed)'
+        log.append(f'[reroute] {tag} has FRESH output ({age_out}s ago) '
+                   f'-> alive, no action')
+        continue
+      # GUARD (b): second sample after a gap -- the shadow gap clears on it.
+      # (dry-run also takes it, so the log shows the true would-be decision.)
+      sleep_fn(confirm_gap_s)
+      # A cheap disk re-check inside the window costs nothing and catches a
+      # write that landed during the gap (v26: time-staggered second sample).
+      mtime2 = output_probe.latest_mtime(e) if output_probe else None
+      if route_lib.output_is_fresh(mtime2, time.time(), fresh_output_s):
+        age_out = int(time.time() - mtime2) if mtime2 else -1
+        e.last_reason = f'alive: output written {age_out}s ago (2nd check)'
+        log.append(f'[reroute] {tag} output FRESH on 2nd check '
+                   f'-> alive, no action')
+        continue
+      state2 = probe.status(xid)
+      if not route_lib.decide_reroute(state, state2, out_fresh):
+        log.append(f'[reroute] {tag} 2nd probe={state2} (not PENDING) '
+                   f'-> alive/ambiguous, no action')
+        continue
+      # Double-confirmed stuck: both probes PENDING and no fresh output.
       if dry_run:
-        log.append(f'[DRY][reroute] would cancel + re-route {tag}: still PENDING')
+        log.append(f'[DRY][reroute] would cancel + re-route {tag}: '
+                   f'PENDING x2, no fresh output')
         continue
       ok, out = sub.cancel(xid)
       if ok:
@@ -708,7 +848,9 @@ def main(argv):
     updated, log = run_reroute(
         entries, now=time.time(), probe=XManagerStatusProbe(),
         reroute_after_s=_REROUTE_AFTER_S.value, cooldown_s=_COOLDOWN_S.value,
-        dry_run=_DRY_RUN.value)
+        dry_run=_DRY_RUN.value, output_probe=CnsOutputProbe(),
+        confirm_gap_s=_CONFIRM_GAP_S.value,
+        fresh_output_s=_FRESH_OUTPUT_S.value)
   else:
     # Drain QUEUED jobs into the XM queue.
     provider = avail_provider.AvailabilityProvider(group=_GROUP.value)
