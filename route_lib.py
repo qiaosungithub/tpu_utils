@@ -44,7 +44,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import random
-from typing import Optional
+from typing import Callable, Optional
 
 
 # --------------------------------------------------------------------------
@@ -60,11 +60,24 @@ V5P_MULTIPLIER: dict[str, float] = {
     'v6e': 2.0,
     'v6p': 4.34,
     'v7': 4.34,
+    # NVIDIA GPUs, per-chip compute vs v5p from the internal `vle` rate card
+    # (borg/util/reports/gxu/gxus_by_platform_ga.textproto): A100 1.58/2.33,
+    # H100/H200 5.02/2.33, B200/B300/GB200/GB300 11.42/2.33. This lets
+    # `--power` compare a GPU ask against a TPU one -- but a GPU only enters a
+    # candidate set when the job's OWN `--archs` lists it, so a TPU run is
+    # never silently handed a GPU.
+    'a100': 0.68, 'a100_80gib': 0.68,
+    'h100': 2.15, 'h200': 2.15,
+    'b200': 4.90, 'b300': 4.90, 'gb200': 4.90, 'gb300': 4.90,
 }
 
 # Newer-first preference among equally-good architectures (mirrors _ARCH_PREF).
+# GPUs sort AFTER all TPUs: when a job lists both a TPU and a GPU arch and both
+# clear, the TPU wins the tie unless price/pool ordering (below) says otherwise.
 ARCH_PREF: dict[str, int] = {
-    'v7': 0, 'v6p': 1, 'v6e': 2, 'v5p': 3, 'v4': 4, 'v5e': 5}
+    'v7': 0, 'v6p': 1, 'v6e': 2, 'v5p': 3, 'v4': 4, 'v5e': 5,
+    'gb300': 10, 'gb200': 11, 'b300': 12, 'b200': 13,
+    'h200': 14, 'h100': 15, 'a100_80gib': 16, 'a100': 17}
 
 # Legal chip counts per arch (mirrors topology._LOCUS_TABLE keys). The router
 # binary can override this with the authoritative topology module; the copy
@@ -76,6 +89,19 @@ LEGAL_SIZES: dict[str, list[int]] = {
     'v7': [4, 8, 16, 32],
     'v6e': [8, 16, 32, 64, 128, 256],
     'v5e': [8, 16, 32, 64],
+    # NVIDIA GPUs -- non-torus; the size is a device count capped at the card's
+    # NVLink domain (mirrors topology._GPU_LEGAL). GPUs have NO GEOMETRY entry
+    # below, so a topology-locked job can never route ONTO or OFF a GPU (its
+    # geometry match always fails), which is the correct safe default for a
+    # mesh-sharded checkpoint.
+    'a100': [1, 2, 4, 8, 16],
+    'a100_80gib': [1, 2, 4, 8],
+    'h100': [1, 2, 4, 8],
+    'h200': [1, 2, 4, 8],
+    'b200': [1, 2, 4, 8],
+    'b300': [1, 2, 4, 8],
+    'gb200': [1, 2, 4, 8, 16, 32, 64, 72],
+    'gb300': [1, 2, 4, 8, 16, 32, 64, 72],
 }
 
 # Mesh GEOMETRY per (arch, chips) -- mirrors topology._LOCUS_TABLE values. This
@@ -205,10 +231,24 @@ def effective_price(raw_price: float, pool_chips: float) -> float:
 class JobState(str, enum.Enum):
   """Lifecycle of a local-queue entry. Strings so the JSON file is readable."""
   QUEUED = 'QUEUED'        # waiting for the router to place it
+  BUILD_REQUESTED = 'BUILD_REQUESTED'  # the router decided this round to dispatch
+                           # it; the serial builder will pick it up next. Transient,
+                           # QUEUED -> BUILD_REQUESTED -> BUILDING. Counts (with
+                           # BUILDING) as "builder not yet drained" for backpressure:
+                           # the router does not open a new dispatch round while any
+                           # BUILD_REQUESTED/BUILDING remains, so headroom math is
+                           # not stale. NOT picked by next_queued (only next_build
+                           # _requested claims it).
   BUILDING = 'BUILDING'    # a serial worker is running `tpu queue` for it NOW
   HELD = 'HELD'            # parked: cannot build as-is (bad workdir / too many
                            # failed attempts). NOT picked by the worker until a
                            # human fixes it (re-enqueue) -- prevents churn.
+  BUDGET_DEFERRED = 'BUDGET_DEFERRED'  # over the G9 credit bar THIS round: a soft,
+                           # non-terminal, auto-recoverable park. NOT HELD, NOT a
+                           # build failure -- attempts is NOT incremented. Re-tested
+                           # every round (promote_deferred -> QUEUED at top of round);
+                           # flows back automatically when headroom opens. A budget
+                           # refusal is a transient FLEET state, not a per-job defect.
   SUBMITTED = 'SUBMITTED'  # handed to XM, watching for RUNNING vs re-route
   RUNNING = 'RUNNING'      # confirmed running; the router is done with it
   DONE = 'DONE'            # finished (terminal)
@@ -216,6 +256,15 @@ class JobState(str, enum.Enum):
 
 
 TERMINAL_STATES = frozenset({JobState.RUNNING, JobState.DONE, JobState.FAILED})
+
+# States whose XID the XM-truth reconcile pass re-verifies against XManager.
+# NOTE: this is deliberately NOT TERMINAL_STATES -- RUNNING is "terminal" there
+# only in the sense of "router stops tracking", but a local RUNNING entry is
+# exactly what turns into a zombie when XM has since dropped it, so reconcile
+# MUST re-check it. BUILD_REQUESTED has no XID yet (builder hasn't run) so it is
+# not reconcilable; BUDGET_DEFERRED/QUEUED/HELD have no live XID either.
+RECONCILABLE_STATES = frozenset(
+    {JobState.RUNNING, JobState.SUBMITTED, JobState.BUILDING})
 
 
 @dataclasses.dataclass
@@ -713,3 +762,189 @@ def requeue_held(entry: QueueEntry) -> QueueEntry:
     entry.attempts = 0
     entry.last_reason = 'requeued from HELD'
   return entry
+
+
+# --- BUILD_REQUESTED + backpressure (router-dispatch / serial-builder split) --
+# The rewritten worker separates the DISPATCH decision (router half: pick jobs
+# that fit headroom this round, mark them BUILD_REQUESTED) from the BUILD action
+# (builder half: serially claim each BUILD_REQUESTED, run `tpu queue`). The two
+# halves live in ONE process but are distinct phases; BUILD_REQUESTED is the
+# handoff token between them, held in the durable queue so it survives a restart.
+
+def mark_build_requested(entry: QueueEntry, reason: str = '') -> QueueEntry:
+  """Router dispatch: mark a QUEUED entry BUILD_REQUESTED (this round's builder
+  will claim it). Transient; does NOT touch attempts or timestamps (the builder
+  stamps build_started_at when it claims). Idempotent for an already-requested
+  entry."""
+  entry.state = JobState.BUILD_REQUESTED
+  entry.last_reason = reason or 'dispatch: fits headroom this round; queued for build'
+  return entry
+
+
+def count_build_pending(entries: list['QueueEntry']) -> int:
+  """How many entries are BUILD_REQUESTED or BUILDING = 'the builder has not yet
+  drained this round'. Backpressure gate: the router must NOT open a new dispatch
+  round while this is > 0, or its headroom query would double-count jobs that are
+  dispatched-but-not-yet-in-the-billing-registry."""
+  return sum(1 for e in entries
+             if e.state in (JobState.BUILD_REQUESTED, JobState.BUILDING))
+
+
+def next_build_requested(entries: list['QueueEntry']) -> Optional['QueueEntry']:
+  """The next BUILD_REQUESTED entry for the serial builder to claim, highest
+  priority first then insertion order (mirrors next_queued). Returns None if the
+  builder has drained this round. Does NOT enforce the single-build invariant --
+  the caller checks can_claim_build first."""
+  reqd = [e for e in entries if e.state == JobState.BUILD_REQUESTED]
+  if not reqd:
+    return None
+  return max(reqd, key=lambda e: e.priority) if len(reqd) > 1 else reqd[0]
+
+
+# --- BUDGET_DEFERRED (soft, auto-recovering budget park) --------------------
+# A budget refusal is a transient FLEET state, not a per-job defect. Instead of
+# counting it as a build failure (attempts++ -> 3-strikes -> permanent HELD), the
+# worker parks the job BUDGET_DEFERRED and re-tests it every round. When headroom
+# opens (a running job ends / income rises / a big job ahead clears) it flows back
+# to QUEUED automatically -- zero human action. attempts is NEVER touched here.
+
+def mark_budget_deferred(entry: QueueEntry, reason: str = '') -> QueueEntry:
+  """Park an entry BUDGET_DEFERRED (over the credit bar this round). NOT HELD,
+  NOT a build failure: attempts is deliberately NOT incremented. Frees the build
+  slot. Re-evaluated next round by promote_deferred."""
+  entry.state = JobState.BUDGET_DEFERRED
+  entry.build_started_at = None
+  entry.worker_id = None
+  entry.last_reason = reason or 'budget-deferred: over the G9 credit bar this round; will retry when headroom opens'
+  return entry
+
+
+def promote_deferred(entries: list['QueueEntry']) -> list['QueueEntry']:
+  """Top-of-round: return every BUDGET_DEFERRED entry to QUEUED so it is re-tested
+  against the CURRENT headroom this round. Returns the list of promoted entries.
+  attempts is untouched (a deferral was never a failure). This makes the deferral
+  a pure per-round re-test: if it is still over the bar, the dispatch step lands
+  it back in BUDGET_DEFERRED; if headroom opened, it dispatches."""
+  promoted = []
+  for e in entries:
+    if e.state == JobState.BUDGET_DEFERRED:
+      e.state = JobState.QUEUED
+      e.last_reason = 'promoted from budget-deferred: re-testing headroom this round'
+      promoted.append(e)
+  return promoted
+
+
+# --- XM-truth reconcile (fixes R3 zombie pollution on the ROUTE path) --------
+# .tpu_local_queue.json keeps state=RUNNING/SUBMITTED for jobs XManager no longer
+# tracks (measured 2026-08-27: 13 local-RUNNING, 0 truly running on XM). Any
+# headroom/reroute logic that reads local `state` is poisoned. The reconcile pass
+# (in the tpu-reroute process) re-verifies every RECONCILABLE_STATES entry's XID
+# against XM and rewrites zombies to terminal. This decision is PURE (XM status is
+# an injected string, so route_lib stays RPC-free); the binary's probe supplies it.
+
+def decide_reconcile(local_state: 'JobState', xm_status: str,
+                     terminal_const: str = 'TERMINAL',
+                     running_const: str = 'RUNNING',
+                     pending_const: str = 'PENDING',
+                     unknown_const: str = 'UNKNOWN') -> Optional['JobState']:
+  """Pure reconcile decision for ONE entry, given its local state and XM's live
+  status. Returns the NEW JobState to write, or None for 'leave unchanged'.
+
+  Safety rule (mirrors decide_reroute): NEVER act on missing data. xm_status
+  UNKNOWN (probe failed) -> None: we do not mark a job dead because a probe
+  hiccuped. Only a definite XM verdict moves an entry.
+
+    XM TERMINAL  -> FAILED     (zombie cleanup: XM dropped it / it failed/stopped)
+    XM RUNNING   & local SUBMITTED -> RUNNING  (placement took; promote)
+    XM RUNNING   & local RUNNING   -> None      (already correct)
+    XM PENDING   -> None       (genuinely still queued in the auction; the reroute
+                                step -- not reconcile -- owns pending>deadline)
+    XM UNKNOWN   -> None       (never act blind)
+  A local entry not in RECONCILABLE_STATES is never passed here (caller filters).
+  """
+  if xm_status == terminal_const:
+    return JobState.FAILED
+  if xm_status == running_const and local_state == JobState.SUBMITTED:
+    return JobState.RUNNING
+  # RUNNING+RUNNING, any PENDING, any UNKNOWN, or an unrecognised status: no-op.
+  return None
+
+
+def reconcile_entry(entry: QueueEntry, xm_status: str, reason: str = '') -> bool:
+  """Apply decide_reconcile to one entry in place. Returns True if the entry's
+  state changed (a zombie was cleaned up or a placement promoted), False if left
+  unchanged. Only touches entries currently in RECONCILABLE_STATES."""
+  if entry.state not in RECONCILABLE_STATES:
+    return False
+  new_state = decide_reconcile(entry.state, xm_status)
+  if new_state is None or new_state == entry.state:
+    return False
+  old = entry.state
+  entry.state = new_state
+  if new_state == JobState.FAILED:
+    entry.last_reason = reason or f'reconciled: XM reports terminal (was local {old.value}); zombie cleaned up'
+  elif new_state == JobState.RUNNING:
+    entry.last_reason = reason or f'reconciled: XM confirms RUNNING (was local {old.value})'
+  return True
+
+
+# --- Step3: greedy dispatch with in-memory pre-debit (router half) ----------
+# The rewritten worker's DISPATCH decision. Each round, with a fresh XM-truth
+# headroom, admit the highest-priority QUEUED jobs that FIT, pre-debiting each
+# admitted job's cost IN MEMORY so a big job at the head cannot be "admitted"
+# twice and small jobs behind it still get their turn. Over-the-bar jobs are
+# deferred (soft), never failed. This is PURE: cost + exemption + headroom are
+# all injected, so it is unit-testable without budget_check, RPCs, or a clock.
+
+@dataclasses.dataclass(frozen=True)
+class DispatchDecision:
+  """One dispatch verdict for one entry this round."""
+  job_id: str
+  decision: 'JobState'          # BUILD_REQUESTED (fits) or BUDGET_DEFERRED (over)
+  cost: float                   # the job's credit cost (0 for exempt)
+  headroom_after: float         # headroom remaining after this decision
+  reason: str = ''
+
+
+def plan_dispatch(
+    queued: list['QueueEntry'],
+    headroom: float,
+    cost_of: Callable[['QueueEntry'], float],
+    is_exempt: Callable[['QueueEntry'], bool],
+) -> list[DispatchDecision]:
+  """Greedy-fill this round's headroom with in-memory pre-debit.
+
+  `queued` is the set of dispatch candidates (the caller passes QUEUED entries).
+  `headroom` is the CURRENT XM-truth headroom (bar - current usage) for the round.
+  `cost_of(e)` returns the job's credit/hr cost; `is_exempt(e)` is True for jobs
+  that do not draw on the G9 bar (g3/g5 own balance, BATCH free pool, CPU-only).
+
+  Returns one DispatchDecision per candidate, in priority order:
+    * exempt            -> BUILD_REQUESTED, no debit (headroom unchanged)
+    * cost <= headroom  -> BUILD_REQUESTED, headroom -= cost   (PRE-DEBIT)
+    * else              -> BUDGET_DEFERRED (soft; re-tested next round)
+  Priority: highest e.priority first, ties keep list order (stable). A big job
+  that does not fit is deferred but does NOT block smaller jobs behind it -- the
+  loop continues, so a later cheaper job can still be admitted (fixes H2's
+  head-of-line starving). Pure: no mutation of the entries, no I/O.
+  """
+  ordered = sorted(queued, key=lambda e: -e.priority)   # stable within priority
+  out: list[DispatchDecision] = []
+  h = headroom
+  for e in ordered:
+    if is_exempt(e):
+      out.append(DispatchDecision(
+          e.job_id, JobState.BUILD_REQUESTED, 0.0, h,
+          'exempt (g3/g5/BATCH/CPU): dispatched without debit'))
+      continue
+    c = cost_of(e)
+    if c <= h:
+      h -= c
+      out.append(DispatchDecision(
+          e.job_id, JobState.BUILD_REQUESTED, c, h,
+          f'fits: cost {c:.1f} <= headroom; pre-debited, {h:.1f} left this round'))
+    else:
+      out.append(DispatchDecision(
+          e.job_id, JobState.BUDGET_DEFERRED, c, h,
+          f'over bar: cost {c:.1f} > headroom {h:.1f}; deferred, retry next round'))
+  return out

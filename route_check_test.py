@@ -313,6 +313,21 @@ class _FakeProbe:
     return self._by_xid.get(xid, RC.STATUS_UNKNOWN)
 
 
+class _BudgetRefusedSubmitter:
+  """submit() returns no xid but WITH the budget marker (over-bar refusal)."""
+
+  def __init__(self):
+    self.calls = []
+    self.cwds = []
+
+  def submit(self, argv, cwd=''):
+    self.calls.append(argv)
+    self.cwds.append(cwd)
+    return None, ('[budget check] total projected: 9999 (Limit: 2228)\n'
+                  '[[BUDGET_DEFERRED]]\n'
+                  '[budget check] ERROR: Budget exceeded for tpu check!')
+
+
 def _submitted(job_id, xid, cell, submitted_at, **kw):
   e = _entry(job_id, **kw)
   e.state = R.JobState.SUBMITTED
@@ -713,6 +728,153 @@ class SerialWorkerTest(unittest.TestCase):
     self.assertEqual(e.state, R.JobState.QUEUED)
     self.assertEqual(e.attempts, 0)
 
+  # --- Step3 R2: budget refusal is NOT a build failure ---
+  def test_budget_deferral_marker_parks_not_attempts(self):
+    # submit returns NO xid but WITH the [[BUDGET_DEFERRED]] marker -> the job
+    # must land BUDGET_DEFERRED with attempts UNCHANGED (not treated as a
+    # build failure). This is the R2 fix.
+    e = _entry('bd', power='v7-32', archs=('v7',))
+    self._seed([e])
+    sub = _BudgetRefusedSubmitter()
+    outcome, log, _ = RC.run_worker_once(
+        self.path, self._prov(), sub, now=100.0, worker_id='w')
+    self.assertEqual(outcome, 'budget_deferred')
+    got = self._byid('bd')
+    self.assertEqual(got.state, R.JobState.BUDGET_DEFERRED)
+    self.assertEqual(got.attempts, 0)              # NOT incremented
+    self.assertIsNone(got.build_started_at)         # slot released
+
+  def test_budget_deferral_never_becomes_held(self):
+    # Even after many over-budget rounds, a budget-refused job never accrues
+    # attempts toward HELD (contrast test_max_attempts_moves_to_HELD).
+    e = _entry('bd2', power='v7-32', archs=('v7',))
+    self._seed([e])
+    sub = _BudgetRefusedSubmitter()
+    for _ in range(5):
+      # promote back to QUEUED (as the top-of-round would) then re-run
+      cur = self._byid('bd2')
+      if cur.state == R.JobState.BUDGET_DEFERRED:
+        R.promote_deferred([cur]); RC.save_queue(self.path, [cur])
+      o, _, _ = RC.run_worker_once(
+          self.path, self._prov(), sub, now=100.0, worker_id='w',
+          max_build_attempts=3)
+      self.assertEqual(o, 'budget_deferred')
+    self.assertEqual(self._byid('bd2').attempts, 0)
+    self.assertNotEqual(self._byid('bd2').state, R.JobState.HELD)
+
+  def test_real_build_failure_still_attempts(self):
+    # a no-XID WITHOUT the marker is still a real failure -> attempts++ (the
+    # existing MODE-1 GUARD path is unchanged by the R2 fix).
+    e = _entry('rf', power='v7-32', archs=('v7',))
+    self._seed([e])
+    sub = _FakeSubmitter(xid=None)                  # no marker, no xid
+    outcome, _, _ = RC.run_worker_once(
+        self.path, self._prov(), sub, now=100.0, worker_id='w')
+    self.assertEqual(outcome, 'requeued')
+    self.assertEqual(self._byid('rf').attempts, 1)  # real failure counts
+
+
+class IsBudgetDeferralTest(unittest.TestCase):
+  """Step3 R2: the [[BUDGET_DEFERRED]] marker parser."""
+
+  def test_plain_marker(self):
+    self.assertTrue(RC.is_budget_deferral('foo\n[[BUDGET_DEFERRED]]\nbar'))
+
+  def test_ansi_wrapped_marker(self):
+    self.assertTrue(RC.is_budget_deferral('\x1b[31m[[BUDGET_DEFERRED]]\x1b[0m'))
+
+  def test_absent(self):
+    self.assertFalse(RC.is_budget_deferral('Launched experiment 123'))
+    self.assertFalse(RC.is_budget_deferral(''))
+    self.assertFalse(RC.is_budget_deferral(None))
+
+  def test_substring_not_matched(self):
+    # must be its OWN line, not embedded in prose (avoid false positives).
+    self.assertFalse(RC.is_budget_deferral('note: [[BUDGET_DEFERRED]] was seen'))
+
+
+class RunDispatchTest(unittest.TestCase):
+  """Step3: run_dispatch_once (router half) -- promote/backpressure/greedy."""
+
+  def setUp(self):
+    self.path = tempfile.mkstemp(suffix='.json')[1]
+    self.addCleanup(lambda: os.path.exists(self.path) and os.remove(self.path))
+    lock = self.path + '.lock'
+    self.addCleanup(lambda: os.path.exists(lock) and os.remove(lock))
+
+  def _seed(self, entries):
+    RC.save_queue(self.path, entries)
+
+  def _byid(self, jid):
+    return {e.job_id: e for e in RC.load_queue(self.path)}[jid]
+
+  def _budget(self, headroom, per_cost, exempt_types=()):
+    """Fake budget_query_fn: fixed headroom; new_cost from per_cost by type."""
+    def fn(tpu_type, tier='PROD', lo='', group=''):
+      return {'income': 1000.0, 'bar': 100.0, 'current': 100.0 - headroom,
+              'headroom': headroom, 'new_cost': per_cost.get(tpu_type, 0.0),
+              'exempt': tpu_type in exempt_types, 'fits': True}
+    return fn
+
+  def _q(self, jid, power='v7-32', archs=('v7',), priority=0):
+    e = _entry(jid, power=power, archs=archs)
+    e.state = R.JobState.QUEUED
+    e.priority = priority
+    return e
+
+  def test_promote_then_dispatch(self):
+    d = self._q('d'); d.state = R.JobState.BUDGET_DEFERRED
+    self._seed([d])
+    out, log = RC.run_dispatch_once(
+        self.path, now=100.0, budget_query_fn=self._budget(1000.0, {'v7-32': 10.0}),
+        dry_run=False)
+    self.assertEqual(out, 'dispatched')
+    self.assertEqual(self._byid('d').state, R.JobState.BUILD_REQUESTED)
+
+  def test_backpressure_skips_dispatch(self):
+    br = self._q('br'); br.state = R.JobState.BUILD_REQUESTED
+    q = self._q('q')
+    self._seed([br, q])
+    out, log = RC.run_dispatch_once(
+        self.path, now=100.0, budget_query_fn=self._budget(1000.0, {}),
+        dry_run=False)
+    self.assertEqual(out, 'backpressure')
+    self.assertEqual(self._byid('q').state, R.JobState.QUEUED)  # not dispatched
+
+  def test_greedy_marks_fit_and_defer(self):
+    a = self._q('a', priority=2); b = self._q('b', priority=1)
+    self._seed([a, b])
+    # headroom 100, each costs 60 -> a fits (60), b deferred (60 > 40 left)
+    out, log = RC.run_dispatch_once(
+        self.path, now=100.0,
+        budget_query_fn=self._budget(100.0, {'v7-32': 60.0}), dry_run=False)
+    self.assertEqual(self._byid('a').state, R.JobState.BUILD_REQUESTED)
+    self.assertEqual(self._byid('b').state, R.JobState.BUDGET_DEFERRED)
+
+  def test_no_budget_fails_safe(self):
+    self._seed([self._q('a')])
+    out, log = RC.run_dispatch_once(
+        self.path, now=100.0, budget_query_fn=lambda *a, **k: None,
+        dry_run=False)
+    self.assertEqual(out, 'no-budget')
+    self.assertEqual(self._byid('a').state, R.JobState.QUEUED)  # untouched, safe
+
+  def test_dry_run_does_not_mutate(self):
+    self._seed([self._q('a')])
+    out, log = RC.run_dispatch_once(
+        self.path, now=100.0, budget_query_fn=self._budget(1000.0, {'v7-32': 1.0}),
+        dry_run=True)
+    self.assertEqual(self._byid('a').state, R.JobState.QUEUED)  # unchanged
+    self.assertTrue(any('DRY' in l for l in log))
+
+  def test_idle_when_no_queued(self):
+    r = self._q('r'); r.state = R.JobState.RUNNING
+    self._seed([r])
+    out, log = RC.run_dispatch_once(
+        self.path, now=100.0, budget_query_fn=self._budget(1000.0, {}),
+        dry_run=False)
+    self.assertEqual(out, 'idle')
+
 
 class GroupOrderTest(unittest.TestCase):
   """The place pass tries groups in preference order (e.g. vqfree g5 then g9).
@@ -783,6 +945,82 @@ class GroupOrderTest(unittest.TestCase):
     self.assertEqual(placed_g9, 1, 'the other falls to g9')
     self.assertTrue(all(e.state == R.JobState.SUBMITTED for e in out))
     self.assertEqual({e.xid for e in out}, {'xid-5', 'xid-9'})
+
+
+class RunReconcileTest(unittest.TestCase):
+  """Step2: XM-truth reconcile pass (run_reconcile) -- R3 zombie cleanup."""
+
+  def _running(self, job_id, xid):
+    e = _submitted(job_id, xid, 'yulpptr', submitted_at=0.0)
+    e.state = R.JobState.RUNNING
+    return e
+
+  def test_zombie_running_marked_failed(self):
+    # local RUNNING but XM says terminal -> the 91%-zombie case.
+    e = self._running('z1', '111')
+    probe = _FakeProbe({'111': RC.STATUS_TERMINAL})
+    out, log = RC.run_reconcile([e], now=100.0, probe=probe, dry_run=False)
+    self.assertEqual(e.state, R.JobState.FAILED)
+    self.assertTrue(any('zombie' in l for l in log))
+
+  def test_submitted_promoted_to_running(self):
+    e = _submitted('p1', '222', 'yulpptr', submitted_at=0.0)
+    probe = _FakeProbe({'222': RC.STATUS_RUNNING})
+    RC.run_reconcile([e], now=100.0, probe=probe, dry_run=False)
+    self.assertEqual(e.state, R.JobState.RUNNING)
+
+  def test_unknown_never_acts(self):
+    # THE safety rule: a probe hiccup must never mark a live job dead.
+    e = self._running('u1', '333')
+    probe = _FakeProbe({'333': RC.STATUS_UNKNOWN})
+    RC.run_reconcile([e], now=100.0, probe=probe, dry_run=False)
+    self.assertEqual(e.state, R.JobState.RUNNING)
+
+  def test_pending_left_for_reroute(self):
+    # reconcile leaves genuinely-pending SUBMITTED for the reroute step.
+    e = _submitted('q1', '444', 'yulpptr', submitted_at=0.0)
+    probe = _FakeProbe({'444': RC.STATUS_PENDING})
+    RC.run_reconcile([e], now=100.0, probe=probe, dry_run=False)
+    self.assertEqual(e.state, R.JobState.SUBMITTED)
+
+  def test_dry_run_does_not_mutate(self):
+    e = self._running('z2', '555')
+    probe = _FakeProbe({'555': RC.STATUS_TERMINAL})
+    _, log = RC.run_reconcile([e], now=100.0, probe=probe, dry_run=True)
+    self.assertEqual(e.state, R.JobState.RUNNING)          # untouched
+    self.assertTrue(any('would set' in l for l in log))
+
+  def test_no_xid_skipped(self):
+    e = _entry('b1')
+    e.state = R.JobState.BUILDING            # BUILDING with no xid
+    e.xid = None
+    probe = _FakeProbe({})
+    RC.run_reconcile([e], now=100.0, probe=probe, dry_run=False)
+    self.assertEqual(e.state, R.JobState.BUILDING)         # no XM identity
+
+  def test_terminal_entries_not_touched(self):
+    # QUEUED/HELD/DONE/FAILED are not in RECONCILABLE_STATES -> never probed.
+    q = _entry('q'); q.state = R.JobState.QUEUED
+    h = _entry('h'); h.state = R.JobState.HELD
+    probe = _FakeProbe({})
+    out, log = RC.run_reconcile([q, h], now=100.0, probe=probe, dry_run=False)
+    self.assertEqual(q.state, R.JobState.QUEUED)
+    self.assertEqual(h.state, R.JobState.HELD)
+    self.assertTrue(any('no non-terminal entries' in l for l in log))
+
+  def test_summary_counts(self):
+    zombie = self._running('z', 'z1')
+    promo = _submitted('p', 'p1', 'c', submitted_at=0.0)
+    unk = self._running('u', 'u1')
+    probe = _FakeProbe({'z1': RC.STATUS_TERMINAL, 'p1': RC.STATUS_RUNNING,
+                        'u1': RC.STATUS_UNKNOWN})
+    _, log = RC.run_reconcile([zombie, promo, unk], now=100.0, probe=probe,
+                              dry_run=False)
+    summary = [l for l in log if 'checked:' in l]
+    self.assertEqual(len(summary), 1)
+    self.assertIn('1 zombie->FAILED', summary[0])
+    self.assertIn('1 promoted->RUNNING', summary[0])
+    self.assertIn('1 UNKNOWN', summary[0])
 
 
 if __name__ == '__main__':

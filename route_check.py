@@ -130,10 +130,35 @@ _FRESH_OUTPUT_S = flags.DEFINE_float(
     'this many seconds is judged ALIVE and never re-routed, whatever XManager '
     'says (disk evidence beats a PENDING snapshot). Default 20 min > a BATCH '
     'work-unit segment.')
+# --- Step2: XM-truth reconcile + the standalone reroute-loop process --------
+_RECONCILE = flags.DEFINE_bool(
+    'reconcile', False, 'Instead of placing QUEUED jobs, run ONE XM-truth '
+    'reconcile pass: re-verify every RUNNING/SUBMITTED/BUILDING entry against '
+    'XManager and rewrite zombies (XM terminal) to FAILED, promote XM-running '
+    'SUBMITTED to RUNNING. Fixes R3 (stale local state poisoning the route path). '
+    'Read-only against XM; only local queue rows change. UNKNOWN never acts.')
+_REROUTE_LOOP = flags.DEFINE_bool(
+    'reroute_loop', False, 'Run as the STANDALONE tpu-reroute PROCESS: an own '
+    'loop that each round does (A) an XM-truth reconcile pass then (B) a reroute '
+    'pass, polling every --reroute_loop_poll_s. This is the design\'s separate '
+    'reroute process -- never blocked by the builder, so B\'s pending>deadline '
+    'safety net always runs. Combine with the daemon set to skip its in-lane '
+    'reroute (TPU_ROUTE_INLANE_REROUTE=0) so reroute does not double-run.')
+_REROUTE_LOOP_POLL_S = flags.DEFINE_float(
+    'reroute_loop_poll_s', 120.0, 'Poll interval for the standalone --reroute_loop '
+    'process (design default ~120s). Reconcile+reroute each round.')
 _WORKER = flags.DEFINE_bool(
     'worker', False, 'Run as the SERIAL build-worker loop: claim one QUEUED job '
     'at a time as BUILDING, run `tpu queue` for it, record the result, repeat. '
     'Only ever one build in flight -- the cure for concurrent-build failures.')
+_DISPATCH_WORKER = flags.DEFINE_bool(
+    'dispatch_worker', False, 'Step3: run the REWRITTEN worker = router-dispatch '
+    '+ serial builder in ONE loop. Each round: promote budget-deferred, '
+    'backpressure-gate, greedy plan_dispatch under XM-truth headroom (mark '
+    'BUILD_REQUESTED/BUDGET_DEFERRED), then serially build one BUILD_REQUESTED. '
+    'Replaces --worker at go-live; the daemon in-lane place pass is gated off so '
+    'this is the ONLY drainer (kills R1). Budget refusal -> BUDGET_DEFERRED, not '
+    'a build failure (kills R2).')
 _WORKER_POLL_S = flags.DEFINE_float(
     'worker_poll_s', 15.0, 'Worker idle poll interval when the queue is empty.')
 _BUILD_STALE_S = flags.DEFINE_float(
@@ -270,19 +295,29 @@ def merge_and_save_touched(
 
 
 def claim_next_build(path: str, now: float, worker_id: str,
-                     stale_after_s: float) -> Optional[route_lib.QueueEntry]:
+                     stale_after_s: float,
+                     pick: 'Callable[[list[route_lib.QueueEntry]], Optional[route_lib.QueueEntry]]' = None
+                     ) -> Optional[route_lib.QueueEntry]:
   """Atomically: reclaim stale BUILDING, then IF no live build is in flight,
-  mark the next QUEUED entry BUILDING and persist. Returns the claimed entry
+  mark the next claimable entry BUILDING and persist. Returns the claimed entry
   (a copy reflecting the persisted state) or None if nothing was claimed
   (queue empty, or a build already in flight). Serialized by an exclusive
-  flock held across the whole read-modify-write."""
+  flock held across the whole read-modify-write.
+
+  `pick` selects which entry to claim from the loaded list; default
+  route_lib.next_queued (the old single-drainer behavior: claim from QUEUED).
+  The Step3 dispatch worker passes route_lib.next_build_requested so the builder
+  claims only what the router already dispatched this round (BUILD_REQUESTED),
+  never re-picking a raw QUEUED job the router has not yet budget-admitted."""
+  if pick is None:
+    pick = route_lib.next_queued
   with with_queue_lock(path):
     entries = load_queue(path)
     route_lib.reclaim_stale_building(entries, now, stale_after_s)
     if not route_lib.can_claim_build(entries, now, stale_after_s):
       save_queue(path, entries)   # persist any reclaim even if we don't claim
       return None
-    nxt = route_lib.next_queued(entries)
+    nxt = pick(entries)
     if nxt is None:
       save_queue(path, entries)
       return None
@@ -341,6 +376,18 @@ def extract_xid(output: str) -> Optional[str]:
   wrapper: accept both the create line and the resume 'work unit(s)' line."""
   m = _XID_RE.search(_ANSI_RE.sub('', output or ''))
   return m.group(1) if m else None
+
+
+def is_budget_deferral(output: str) -> bool:
+  """True iff `tpu queue` output carries the budget-check marker `[[BUDGET_DEFERRED]]`
+  on its own line (post-ANSI-strip). budget_check.py (wiki_agent-owned) prints
+  this stable, ANSI-free line when a submit is over the G9 bar. The worker greps
+  it to tell 'no XID because budget refused' (a transient FLEET state -> park
+  BUDGET_DEFERRED, NO attempt++) apart from 'no XID because the build crashed'
+  (a real per-job defect -> attempt++, eventually HELD). This is the R2 fix: a
+  budget refusal must never be punished as a build failure."""
+  clean = _ANSI_RE.sub('', output or '')
+  return any(line.strip() == '[[BUDGET_DEFERRED]]' for line in clean.splitlines())
 
 
 # --- the submit seam ------------------------------------------------------
@@ -525,6 +572,70 @@ class CnsOutputProbe:
       if newest is None or mt > newest:
         newest = mt
     return newest
+
+
+# --- Step2: XM-truth reconcile pass (fixes R3 zombie pollution) -------------
+def run_reconcile(
+    entries: list[route_lib.QueueEntry],
+    now: float,
+    probe: _StatusProbe,
+    dry_run: bool = True,
+) -> tuple[list[route_lib.QueueEntry], list[str]]:
+  """Re-verify every non-terminal (RECONCILABLE_STATES) entry against XManager
+  and clean up stale local state. Returns (entries, log_lines).
+
+  This is the reconcile half of the standalone tpu-reroute process. It fixes R3:
+  .tpu_local_queue.json keeps state=RUNNING/SUBMITTED for jobs XManager no longer
+  tracks (measured 2026-08-27: 13 local-RUNNING, 0 truly running on XM = ~21.7k
+  cr/hr phantom occupancy on the ROUTE path). Any headroom/reroute logic reading
+  local `state` is poisoned; this pass rewrites zombies to terminal so the route
+  path is clean too (the billing path is already XM-truth via budget_check).
+
+  The DECISION is pure (route_lib.decide_reconcile); here we only add the live
+  probe and the log. Safety mirrors run_reroute: an UNKNOWN probe NEVER acts, so
+  a probe hiccup can never mark a live job dead. Only a definite XM verdict moves
+  an entry. In dry_run the decision is logged but the entry is not mutated.
+  """
+  log: list[str] = []
+  targets = [e for e in entries if e.state in route_lib.RECONCILABLE_STATES]
+  if not targets:
+    log.append('[reconcile] no non-terminal entries to reconcile.')
+    return entries, log
+  n_zombie = n_promoted = n_unknown = n_noop = 0
+  for e in targets:
+    xid = e.xid
+    if not xid:
+      # A BUILDING/SUBMITTED row with no xid has no XM identity to check.
+      continue
+    st = probe.status(str(xid))
+    tag = f'{e.job_id} (xid={xid}, local {e.state.value}, XM {st})'
+    new_state = route_lib.decide_reconcile(e.state, st)
+    if new_state is None:
+      if st == STATUS_UNKNOWN:
+        n_unknown += 1
+      else:
+        n_noop += 1
+      continue
+    if dry_run:
+      log.append(f'[DRY][reconcile] would set {tag} -> {new_state.value}')
+      if new_state == route_lib.JobState.FAILED:
+        n_zombie += 1
+      else:
+        n_promoted += 1
+      continue
+    changed = route_lib.reconcile_entry(e, st)
+    if changed:
+      if e.state == route_lib.JobState.FAILED:
+        n_zombie += 1
+        log.append(f'[reconcile] {tag} -> FAILED (zombie cleaned up)')
+      else:
+        n_promoted += 1
+        log.append(f'[reconcile] {tag} -> RUNNING (placement confirmed)')
+  log.append(
+      f'[reconcile] {len(targets)} checked: {n_zombie} zombie->FAILED, '
+      f'{n_promoted} promoted->RUNNING, {n_unknown} UNKNOWN (left alone), '
+      f'{n_noop} already-correct.')
+  return entries, log
 
 
 # --- the re-route sweep ---------------------------------------------------
@@ -742,6 +853,7 @@ def run_worker_once(
     srcfs_fail_brake: int = 20,
     last_fail_count: Optional[int] = None,
     max_build_attempts: int = 3,
+    claim_pick: 'Callable[[list[route_lib.QueueEntry]], Optional[route_lib.QueueEntry]]' = None,
 ) -> tuple[str, list[str], Optional[int]]:
   """One worker step. Returns (outcome, log_lines, new_fail_count).
 
@@ -772,7 +884,8 @@ def run_worker_once(
 
   # ATOMIC CLAIM: reclaim stale, then take the next QUEUED as BUILDING iff no
   # live build is in flight. This is the serial lock.
-  claimed = claim_next_build(queue_file, now, worker_id, build_stale_s)
+  claimed = claim_next_build(queue_file, now, worker_id, build_stale_s,
+                             pick=claim_pick)
   if claimed is None:
     # Distinguish 'a build is in flight' from 'nothing to do' for the log.
     entries = load_queue(queue_file)
@@ -823,6 +936,22 @@ def run_worker_once(
     log.append(f'[worker] {claimed.job_id} -> SUBMITTED xid={xid} cell={placement.cell}')
     return 'submitted', log, new_fail_count
 
+  # R2 FIX: BUDGET-DEFERRAL is NOT a build failure. Before the MODE-1 GUARD
+  # counts this no-XID as an attempt, check for the budget marker: budget_check
+  # printed `[[BUDGET_DEFERRED]]` because the submit was over the G9 bar. That is
+  # a transient FLEET state, not a defect of this job. Park it BUDGET_DEFERRED
+  # (soft, auto-promoted next round) WITHOUT touching attempts -- so a job that
+  # merely hit a few over-budget rounds is never parked in HELD. Slot released.
+  if is_budget_deferral(out):
+    def _deferred(e: route_lib.QueueEntry) -> None:
+      route_lib.mark_budget_deferred(
+          e, f'budget-deferred at build: over the G9 bar; will retry when '
+          f'headroom opens (attempts untouched at {e.attempts}). {_tail(out)}')
+    update_entry(queue_file, claimed.job_id, _deferred)
+    log.append(f'[worker] {claimed.job_id} -> BUDGET_DEFERRED (over bar, NOT a '
+               f'build failure; attempts unchanged); slot released.')
+    return 'budget_deferred', log, new_fail_count
+
   # MODE-1 GUARD: no XID / found[] zombie -> NOT submitted. Count the attempt.
   # Requeue for a retry UNLESS it has now failed max_build_attempts times, in
   # which case park it in HELD so one bad job cannot churn the worker forever
@@ -850,6 +979,139 @@ def run_worker_once(
   log.append(f'[worker] {claimed.job_id} -> NO XID (found[]/build crash); requeued '
              f'({attempts_after}/{max_build_attempts}). tail: {_tail(out)}')
   return 'requeued', log, new_fail_count
+
+
+# --- Step3: the budget seam (reuse wiki_agent budget_check --query) ----------
+DEFAULT_BUDGET_SCRIPT = os.path.expanduser('~/work/wiki_agents/tools/budget_check.py')
+
+
+def budget_query(tpu_type: str, tier: str = 'PROD', lo_price: str = '',
+                 group: str = '', script: str = DEFAULT_BUDGET_SCRIPT,
+                 timeout_s: float = 60.0) -> Optional[dict]:
+  """Call budget_check.py --query and return its JSON dict, or None on failure.
+
+  The dict is {income,bar,current,headroom,new_cost,exempt,fits}; `current` is
+  XM-truth (budget_check cross-refs the check-cache and age-filters zombies), so
+  the router NEVER recomputes cost -- it consumes this. Owner split: billing is
+  wiki_agent's; the router only asks. Returns None if the script is missing or
+  the call fails/timeouts, so the caller can fail SAFE (treat as no-headroom /
+  skip dispatch) rather than guess a number.
+  """
+  if not os.path.isfile(script):
+    return None
+  argv = ['python3', script, '--query', tpu_type, tier or 'PROD',
+          lo_price or '0', group or '']
+  try:
+    out = subprocess.run(argv, capture_output=True, text=True,
+                         timeout=timeout_s)
+    line = _ANSI_RE.sub('', (out.stdout or '').strip()).splitlines()
+    if not line:
+      return None
+    return json.loads(line[-1])   # --query prints ONE json line last
+  except Exception:  # pylint: disable=broad-except
+    return None
+
+
+# --- Step3: the router half -- greedy dispatch under backpressure ------------
+def run_dispatch_once(
+    queue_file: str,
+    now: float,
+    group: str = DEFAULT_GROUP,
+    budget_query_fn: 'Callable[..., Optional[dict]]' = budget_query,
+    dry_run: bool = True,
+) -> tuple[str, list[str]]:
+  """ONE router-dispatch round (the DISPATCH half of the rewritten worker).
+
+  Sequence (design 3.1):
+    1. promote BUDGET_DEFERRED -> QUEUED   (top-of-round: everyone re-tests)
+    2. BACKPRESSURE: if any BUILD_REQUESTED/BUILDING remains, the builder has
+       not drained the prior round -> do NOT dispatch (headroom would be stale).
+    3. query XM-truth headroom, then greedy plan_dispatch with in-memory
+       pre-debit over the QUEUED entries.
+    4. apply: fits -> BUILD_REQUESTED ; over-bar -> BUDGET_DEFERRED.
+  Returns (outcome, log). outcome in {'promoted-only','backpressure','dispatched',
+  'idle','no-budget'}. All writes go through with_queue_lock. Pure decision is in
+  route_lib.plan_dispatch; here we add the queue I/O and the budget seam.
+  """
+  log: list[str] = []
+
+  # 1. promote deferred (under lock) so they re-test this round.
+  with with_queue_lock(queue_file):
+    entries = load_queue(queue_file)
+    promoted = route_lib.promote_deferred(entries)
+    if promoted:
+      save_queue(queue_file, entries)
+  if promoted:
+    log.append(f'[dispatch] promoted {len(promoted)} BUDGET_DEFERRED -> QUEUED '
+               f'for re-test this round.')
+
+  # 2. BACKPRESSURE: builder still draining -> skip dispatch.
+  entries = load_queue(queue_file)
+  pending = route_lib.count_build_pending(entries)
+  if pending > 0:
+    log.append(f'[dispatch] backpressure: {pending} BUILD_REQUESTED/BUILDING '
+               f'still draining; no new dispatch this round.')
+    return 'backpressure', log
+
+  queued = [e for e in entries if e.state == route_lib.JobState.QUEUED]
+  if not queued:
+    log.append('[dispatch] no QUEUED jobs to dispatch.')
+    return 'idle', log
+
+  # 3. headroom (XM-truth). One query for the round's starting headroom; the
+  #    per-candidate cost also comes from the seam, and plan_dispatch pre-debits
+  #    in memory so we do not double-count within the round.
+  probe0 = budget_query_fn('v6e-16', 'PROD', '', group)  # any type: we want bar/current
+  if probe0 is None:
+    log.append('[dispatch] budget query unavailable -> fail SAFE: no dispatch '
+               'this round (never guess headroom).')
+    return 'no-budget', log
+  headroom = float(probe0.get('headroom', 0.0))
+  log.append(f'[dispatch] headroom={headroom:.1f} cr/hr (bar={probe0.get("bar")} '
+             f'current={probe0.get("current")}); {len(queued)} queued candidates.')
+
+  # per-entry cost + exemption via the same seam (cached per type within round).
+  _cost_cache: dict = {}
+  def _type_of(e: route_lib.QueueEntry) -> str:
+    if e.arch and e.chips:
+      return f'{e.arch}-{e.chips}'
+    return e.power
+  def _probe(e: route_lib.QueueEntry) -> dict:
+    key = (_type_of(e), e.tier or 'PROD')
+    if key not in _cost_cache:
+      _cost_cache[key] = budget_query_fn(key[0], key[1], '', group) or {}
+    return _cost_cache[key]
+  def cost_of(e: route_lib.QueueEntry) -> float:
+    return float(_probe(e).get('new_cost', 0.0))
+  def is_exempt(e: route_lib.QueueEntry) -> bool:
+    return bool(_probe(e).get('exempt', False))
+
+  plan = route_lib.plan_dispatch(queued, headroom, cost_of, is_exempt)
+
+  # 4. apply the plan under lock.
+  decided = {d.job_id: d for d in plan}
+  n_req = n_def = 0
+  with with_queue_lock(queue_file):
+    live = load_queue(queue_file)
+    for e in live:
+      d = decided.get(e.job_id)
+      if d is None or e.state != route_lib.JobState.QUEUED:
+        continue   # only touch entries still QUEUED (a concurrent claim may have moved one)
+      if dry_run:
+        continue
+      if d.decision == route_lib.JobState.BUILD_REQUESTED:
+        route_lib.mark_build_requested(e, d.reason); n_req += 1
+      else:
+        route_lib.mark_budget_deferred(e, d.reason); n_def += 1
+    if not dry_run and (n_req or n_def):
+      save_queue(queue_file, live)
+  if dry_run:
+    for d in plan:
+      log.append(f'[DRY][dispatch] {d.job_id} -> {d.decision.value} ({d.reason})')
+    return 'dispatched', log
+  log.append(f'[dispatch] dispatched {n_req} -> BUILD_REQUESTED, '
+             f'{n_def} -> BUDGET_DEFERRED.')
+  return 'dispatched', log
 
 
 def run_worker_loop(
@@ -886,6 +1148,61 @@ def run_worker_loop(
       time.sleep(poll_s)
 
 
+def run_dispatch_worker_loop(
+    queue_file: str,
+    provider_factory: 'Callable[[], _Provider]',
+    submitter: _Submitter,
+    worker_id: str,
+    poll_s: float = 15.0,
+    build_stale_s: float = 1800.0,
+    group: str = DEFAULT_GROUP,
+    stage_probe: Optional[_StageHealthProbe] = None,
+    srcfs_fail_brake: int = 20,
+    max_build_attempts: int = 3,
+    budget_query_fn: 'Callable[..., Optional[dict]]' = budget_query,
+    max_iterations: Optional[int] = None,
+) -> None:
+  """Step3 combined loop (the rewritten worker): DISPATCH then BUILD, forever.
+
+  Each round:
+    1. run_dispatch_once: promote deferred -> backpressure gate -> greedy
+       plan_dispatch with XM-truth headroom -> mark BUILD_REQUESTED/BUDGET_DEFERRED.
+    2. drain THIS round's BUILD_REQUESTED serially: claim one (via
+       next_build_requested, NOT next_queued), run `tpu queue`, record. The
+       single-build invariant (one BUILDING at a time) is unchanged. A no-XID
+       with the budget marker parks BUDGET_DEFERRED (R2), a real failure counts
+       an attempt as before.
+  This is ONE process = router+builder (design 3.1). R1 dies because this is the
+  ONLY place that calls `tpu queue`; the daemon's in-lane place pass is gated off
+  at go-live (TPU_ROUTE_INLANE_PLACE=0). `max_iterations` bounds it for tests.
+  """
+  last_fail = None
+  it = 0
+  while max_iterations is None or it < max_iterations:
+    it += 1
+    # 1. DISPATCH round.
+    _, dlog = run_dispatch_once(
+        queue_file, now=time.time(), group=group,
+        budget_query_fn=budget_query_fn, dry_run=False)
+    for line in dlog:
+      print(line, flush=True)
+    # 2. BUILD one BUILD_REQUESTED (serial). Claim from BUILD_REQUESTED so we
+    #    never build a job the router has not budget-admitted this round.
+    provider = provider_factory()
+    outcome, wlog, last_fail = run_worker_once(
+        queue_file, provider, submitter, now=time.time(), worker_id=worker_id,
+        build_stale_s=build_stale_s, group=group, stage_probe=stage_probe,
+        srcfs_fail_brake=srcfs_fail_brake, last_fail_count=last_fail,
+        max_build_attempts=max_build_attempts,
+        claim_pick=route_lib.next_build_requested)
+    for line in wlog:
+      print(line, flush=True)
+    # Drain fast after a successful build; otherwise sleep so an idle/busy/braked
+    # queue does not spin.
+    if outcome not in ('submitted',):
+      time.sleep(poll_s)
+
+
 def main(argv):
   del argv
 
@@ -909,6 +1226,68 @@ def main(argv):
     )
     return
 
+  if _DISPATCH_WORKER.value:
+    # Step3 REWRITTEN worker: router-dispatch + serial builder in one loop.
+    import socket
+    worker_id = f'{socket.gethostname()}:{os.getpid()}'
+    print(f'[dispatch-worker] router+builder loop {worker_id} on '
+          f'{_QUEUE_FILE.value}; greedy dispatch under XM-truth headroom, serial '
+          f'build, poll {_WORKER_POLL_S.value}s.', flush=True)
+    run_dispatch_worker_loop(
+        _QUEUE_FILE.value,
+        provider_factory=lambda: avail_provider.AvailabilityProvider(group=_GROUP.value),
+        submitter=Submitter(),
+        worker_id=worker_id,
+        poll_s=_WORKER_POLL_S.value,
+        build_stale_s=_BUILD_STALE_S.value,
+        group=_GROUP.value,
+        srcfs_fail_brake=_SRCFS_FAIL_BRAKE.value,
+        max_build_attempts=_MAX_BUILD_ATTEMPTS.value,
+    )
+    return
+
+  if _REROUTE_LOOP.value:
+    # STANDALONE tpu-reroute PROCESS (Step2). Its OWN loop, independent of the
+    # builder, so the reroute safety net (pending>deadline cancel) always runs
+    # even while the serial builder is busy. Each round: (A) XM-truth reconcile
+    # to clean zombies off the route path, then (B) the reroute sweep. Both go
+    # through the same load/merge-write path as the daemon's one-shot passes, so
+    # concurrency is unchanged (with_queue_lock cross-process flock).
+    print(f'[reroute-loop] standalone reconcile+reroute on {_QUEUE_FILE.value}; '
+          f'poll {_REROUTE_LOOP_POLL_S.value}s.', flush=True)
+    while True:
+      # (A) reconcile pass
+      try:
+        snap = load_queue(_QUEUE_FILE.value)
+        rc_entries, rc_log = run_reconcile(
+            snap, now=time.time(), probe=XManagerStatusProbe(),
+            dry_run=_DRY_RUN.value)
+        for line in rc_log:
+          print(f'  [reroute-loop:reconcile] {line}', flush=True)
+        if not _DRY_RUN.value:
+          merge_and_save_touched(_QUEUE_FILE.value, rc_entries)
+      except Exception as e:  # pylint: disable=broad-except
+        print(f'  [reroute-loop:reconcile] pass FAILED (non-fatal): {e}',
+              flush=True)
+      # (B) reroute pass
+      try:
+        snap = load_queue(_QUEUE_FILE.value)
+        rr_entries, rr_log = run_reroute(
+            snap, now=time.time(), probe=XManagerStatusProbe(),
+            reroute_after_s=_REROUTE_AFTER_S.value, cooldown_s=_COOLDOWN_S.value,
+            dry_run=_DRY_RUN.value, output_probe=CnsOutputProbe(),
+            confirm_gap_s=_CONFIRM_GAP_S.value,
+            fresh_output_s=_FRESH_OUTPUT_S.value)
+        for line in rr_log:
+          print(f'  [reroute-loop:reroute] {line}', flush=True)
+        if not _DRY_RUN.value:
+          merge_and_save_touched(_QUEUE_FILE.value, rr_entries)
+      except Exception as e:  # pylint: disable=broad-except
+        print(f'  [reroute-loop:reroute] pass FAILED (non-fatal): {e}',
+              flush=True)
+      time.sleep(_REROUTE_LOOP_POLL_S.value)
+    return  # unreachable; defensive
+
   # Read an unlocked SNAPSHOT for the pass. The slow work below (status/avail
   # RPCs, cancel/submit, the confirm-gap sleep) runs on this snapshot WITHOUT
   # holding the queue lock, so a concurrent `tpu enqueue` is never blocked for
@@ -917,7 +1296,12 @@ def main(argv):
   # our changes back in by job_id -- so rows enqueued during the RPCs survive.
   entries = load_queue(_QUEUE_FILE.value)
 
-  if _REROUTE.value:
+  if _RECONCILE.value:
+    # One-shot XM-truth reconcile pass (Step2). Clean zombies off the route path.
+    updated, log = run_reconcile(
+        entries, now=time.time(), probe=XManagerStatusProbe(),
+        dry_run=_DRY_RUN.value)
+  elif _REROUTE.value:
     # Sweep SUBMITTED jobs stuck PENDING; cancel + return to QUEUED.
     updated, log = run_reroute(
         entries, now=time.time(), probe=XManagerStatusProbe(),
@@ -947,7 +1331,17 @@ def main(argv):
       if len(group_order) > 1:
         log.append(f'[route_check] === placement pass under group {grp} '
                    f'({gi + 1}/{len(group_order)}) ===')
-      provider = avail_provider.AvailabilityProvider(group=grp)
+      # Scope this pass's availability fetch to the archs actually queued (one
+      # RPC per arch). Without this, adding the 8 GPU archs to ARCH_PLATFORM
+      # would make every tick fire 13 serial RPCs even for an all-TPU queue.
+      # GPU archs are in ARCH_PLATFORM (GAP#1a), so a queued GPU job's arch is
+      # kept here and its availability IS fetched.
+      queued_archs = sorted({
+          a.lower() for e in remaining for a in (e.allowed_archs or [])
+          if a.lower() in avail_provider.ARCH_PLATFORM
+      })
+      provider = avail_provider.AvailabilityProvider(
+          group=grp, archs=queued_archs or None)
       updated, tick_log = run_tick(
           updated, provider, now=time.time(),
           dry_run=_DRY_RUN.value, group=grp,

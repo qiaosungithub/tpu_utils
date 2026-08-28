@@ -484,5 +484,253 @@ class SerialWorkerInvariantTest(unittest.TestCase):
     self.assertEqual(e.worker_id, 'w7')
 
 
+class BuildRequestedBackpressureTest(unittest.TestCase):
+  """Step1: BUILD_REQUESTED handoff token + backpressure counting."""
+
+  def _q(self, job_id, state, **kw):
+    e = _entry(job_id)
+    e.state = state
+    for k, v in kw.items():
+      setattr(e, k, v)
+    return e
+
+  def test_mark_build_requested_transitions_without_touching_attempts(self):
+    e = self._q('a', R.JobState.QUEUED, attempts=2)
+    R.mark_build_requested(e)
+    self.assertEqual(e.state, R.JobState.BUILD_REQUESTED)
+    self.assertEqual(e.attempts, 2)  # dispatch is not a failure
+
+  def test_count_build_pending_counts_requested_and_building(self):
+    es = [self._q('a', R.JobState.QUEUED),
+          self._q('b', R.JobState.BUILD_REQUESTED),
+          self._q('c', R.JobState.BUILDING, build_started_at=1.0),
+          self._q('d', R.JobState.SUBMITTED),
+          self._q('e', R.JobState.BUDGET_DEFERRED)]
+    self.assertEqual(R.count_build_pending(es), 2)
+
+  def test_count_build_pending_zero_means_builder_drained(self):
+    es = [self._q('a', R.JobState.QUEUED), self._q('d', R.JobState.SUBMITTED)]
+    self.assertEqual(R.count_build_pending(es), 0)
+
+  def test_next_build_requested_priority_then_none(self):
+    es = [self._q('lo', R.JobState.BUILD_REQUESTED, priority=1),
+          self._q('hi', R.JobState.BUILD_REQUESTED, priority=9),
+          self._q('q', R.JobState.QUEUED, priority=99)]  # QUEUED not eligible
+    self.assertEqual(_ok(R.next_build_requested(es)).job_id, 'hi')
+    for e in es:
+      if e.state == R.JobState.BUILD_REQUESTED:
+        e.state = R.JobState.BUILDING
+    self.assertIsNone(R.next_build_requested(es))
+
+  def test_next_queued_ignores_build_requested(self):
+    # BUILD_REQUESTED must NOT be re-picked by next_queued (only the builder
+    # claims it) -- otherwise a job dispatched this round gets double-dispatched.
+    es = [self._q('r', R.JobState.BUILD_REQUESTED, priority=9),
+          self._q('q', R.JobState.QUEUED, priority=1)]
+    self.assertEqual(_ok(R.next_queued(es)).job_id, 'q')
+
+
+class BudgetDeferredTest(unittest.TestCase):
+  """Step1: BUDGET_DEFERRED soft park + per-round promote."""
+
+  def _q(self, job_id, state, **kw):
+    e = _entry(job_id)
+    e.state = state
+    for k, v in kw.items():
+      setattr(e, k, v)
+    return e
+
+  def test_mark_budget_deferred_does_not_increment_attempts(self):
+    e = self._q('a', R.JobState.BUILDING, attempts=1, build_started_at=5.0,
+                worker_id='w1')
+    R.mark_budget_deferred(e)
+    self.assertEqual(e.state, R.JobState.BUDGET_DEFERRED)
+    self.assertEqual(e.attempts, 1)          # budget refusal is NOT a failure
+    self.assertIsNone(e.build_started_at)     # slot freed
+    self.assertIsNone(e.worker_id)
+
+  def test_mark_budget_deferred_never_becomes_held(self):
+    # Even after many rounds of deferral, a job never accrues attempts toward HELD.
+    e = self._q('a', R.JobState.QUEUED, attempts=0)
+    for _ in range(10):
+      R.mark_budget_deferred(e)
+      R.promote_deferred([e])
+    self.assertEqual(e.attempts, 0)
+    self.assertNotEqual(e.state, R.JobState.HELD)
+
+  def test_promote_deferred_returns_to_queued(self):
+    es = [self._q('a', R.JobState.BUDGET_DEFERRED),
+          self._q('b', R.JobState.QUEUED),
+          self._q('c', R.JobState.BUDGET_DEFERRED)]
+    promoted = R.promote_deferred(es)
+    self.assertEqual(sorted(e.job_id for e in promoted), ['a', 'c'])
+    self.assertTrue(all(e.state == R.JobState.QUEUED for e in es))
+
+  def test_promote_deferred_noop_when_none_deferred(self):
+    es = [self._q('b', R.JobState.QUEUED), self._q('r', R.JobState.RUNNING)]
+    self.assertEqual(R.promote_deferred(es), [])
+
+
+class ReconcileTest(unittest.TestCase):
+  """Step1: XM-truth reconcile pure decision (R3 zombie cleanup)."""
+
+  def _q(self, job_id, state, **kw):
+    e = _entry(job_id)
+    e.state = state
+    for k, v in kw.items():
+      setattr(e, k, v)
+    return e
+
+  # --- decide_reconcile truth table ---
+  def test_terminal_from_running_is_failed(self):
+    self.assertEqual(
+        R.decide_reconcile(R.JobState.RUNNING, 'TERMINAL'), R.JobState.FAILED)
+
+  def test_terminal_from_submitted_is_failed(self):
+    self.assertEqual(
+        R.decide_reconcile(R.JobState.SUBMITTED, 'TERMINAL'), R.JobState.FAILED)
+
+  def test_running_promotes_submitted(self):
+    self.assertEqual(
+        R.decide_reconcile(R.JobState.SUBMITTED, 'RUNNING'), R.JobState.RUNNING)
+
+  def test_running_running_is_noop(self):
+    self.assertIsNone(R.decide_reconcile(R.JobState.RUNNING, 'RUNNING'))
+
+  def test_pending_is_noop(self):
+    # reroute (not reconcile) owns pending>deadline; reconcile leaves it.
+    self.assertIsNone(R.decide_reconcile(R.JobState.SUBMITTED, 'PENDING'))
+
+  def test_unknown_never_acts(self):
+    # THE safety rule: a probe hiccup must never mark a live job dead.
+    self.assertIsNone(R.decide_reconcile(R.JobState.RUNNING, 'UNKNOWN'))
+    self.assertIsNone(R.decide_reconcile(R.JobState.SUBMITTED, 'UNKNOWN'))
+
+  def test_unrecognised_status_is_noop(self):
+    self.assertIsNone(R.decide_reconcile(R.JobState.RUNNING, 'WAT'))
+
+  # --- reconcile_entry mutator ---
+  def test_reconcile_entry_cleans_zombie(self):
+    e = self._q('z', R.JobState.RUNNING, xid='123')
+    self.assertTrue(R.reconcile_entry(e, 'TERMINAL'))
+    self.assertEqual(e.state, R.JobState.FAILED)
+    self.assertIn('zombie', e.last_reason)
+
+  def test_reconcile_entry_promotes_placement(self):
+    e = self._q('p', R.JobState.SUBMITTED, xid='123')
+    self.assertTrue(R.reconcile_entry(e, 'RUNNING'))
+    self.assertEqual(e.state, R.JobState.RUNNING)
+
+  def test_reconcile_entry_unknown_leaves_unchanged(self):
+    e = self._q('u', R.JobState.RUNNING, xid='123')
+    self.assertFalse(R.reconcile_entry(e, 'UNKNOWN'))
+    self.assertEqual(e.state, R.JobState.RUNNING)
+
+  def test_reconcile_entry_skips_non_reconcilable(self):
+    # QUEUED/HELD/BUDGET_DEFERRED/DONE/FAILED are never reconciled (no live xid).
+    for st in (R.JobState.QUEUED, R.JobState.HELD, R.JobState.BUDGET_DEFERRED,
+               R.JobState.DONE, R.JobState.FAILED, R.JobState.BUILD_REQUESTED):
+      e = self._q('x', st)
+      self.assertFalse(R.reconcile_entry(e, 'TERMINAL'),
+                       f'{st} should not be reconciled')
+      self.assertEqual(e.state, st)
+
+  def test_reconcilable_states_membership(self):
+    self.assertEqual(
+        R.RECONCILABLE_STATES,
+        frozenset({R.JobState.RUNNING, R.JobState.SUBMITTED, R.JobState.BUILDING}))
+
+
+class NewStateSerdeTest(unittest.TestCase):
+  """Step1: the two new states survive the JSON round-trip (readable strings)."""
+
+  def test_build_requested_roundtrip(self):
+    e = _entry()
+    e.state = R.JobState.BUILD_REQUESTED
+    d = e.to_dict()
+    self.assertEqual(d['state'], 'BUILD_REQUESTED')
+    self.assertEqual(R.QueueEntry.from_dict(d).state, R.JobState.BUILD_REQUESTED)
+
+  def test_budget_deferred_roundtrip(self):
+    e = _entry()
+    e.state = R.JobState.BUDGET_DEFERRED
+    d = e.to_dict()
+    self.assertEqual(d['state'], 'BUDGET_DEFERRED')
+    self.assertEqual(R.QueueEntry.from_dict(d).state, R.JobState.BUDGET_DEFERRED)
+
+
+class PlanDispatchTest(unittest.TestCase):
+  """Step3: greedy dispatch with in-memory pre-debit (route_lib.plan_dispatch)."""
+
+  def _q(self, job_id, priority=0):
+    e = _entry(job_id)
+    e.state = R.JobState.QUEUED
+    e.priority = priority
+    return e
+
+  def _plan(self, entries, headroom, costs, exempt=()):
+    cost_of = lambda e: costs.get(e.job_id, 0.0)
+    is_exempt = lambda e: e.job_id in exempt
+    return R.plan_dispatch(entries, headroom, cost_of, is_exempt)
+
+  def test_empty_is_empty(self):
+    self.assertEqual(self._plan([], 100.0, {}), [])
+
+  def test_all_fit_all_dispatched(self):
+    es = [self._q('a'), self._q('b')]
+    out = self._plan(es, 100.0, {'a': 30.0, 'b': 40.0})
+    self.assertTrue(all(d.decision == R.JobState.BUILD_REQUESTED for d in out))
+    self.assertAlmostEqual(out[-1].headroom_after, 30.0)  # 100-30-40
+
+  def test_pre_debit_stops_over_dispatch(self):
+    # Two 60-cost jobs, headroom 100: only the first fits (60), second deferred
+    # (60 > 40 left). Without pre-debit both would be admitted against 100.
+    es = [self._q('a', priority=2), self._q('b', priority=1)]
+    out = self._plan(es, 100.0, {'a': 60.0, 'b': 60.0})
+    self.assertEqual(out[0].decision, R.JobState.BUILD_REQUESTED)
+    self.assertEqual(out[1].decision, R.JobState.BUDGET_DEFERRED)
+
+  def test_priority_order(self):
+    es = [self._q('lo', priority=1), self._q('hi', priority=9)]
+    out = self._plan(es, 1000.0, {'lo': 1.0, 'hi': 1.0})
+    self.assertEqual(out[0].job_id, 'hi')  # highest priority first
+
+  def test_head_of_line_does_not_block_smaller(self):
+    # Big expensive job at head does NOT fit; a smaller cheaper job behind it
+    # STILL gets dispatched (fixes H2 starvation).
+    es = [self._q('big', priority=9), self._q('small', priority=1)]
+    out = self._plan(es, 100.0, {'big': 500.0, 'small': 50.0})
+    by = {d.job_id: d.decision for d in out}
+    self.assertEqual(by['big'], R.JobState.BUDGET_DEFERRED)
+    self.assertEqual(by['small'], R.JobState.BUILD_REQUESTED)  # not blocked
+
+  def test_exempt_dispatched_without_debit(self):
+    # An exempt job (g5/BATCH/CPU) is dispatched and does NOT consume headroom.
+    es = [self._q('ex', priority=9), self._q('paid', priority=1)]
+    out = self._plan(es, 50.0, {'ex': 999.0, 'paid': 50.0}, exempt={'ex'})
+    by = {d.job_id: d for d in out}
+    self.assertEqual(by['ex'].decision, R.JobState.BUILD_REQUESTED)
+    self.assertEqual(by['ex'].cost, 0.0)                 # no debit for exempt
+    self.assertEqual(by['paid'].decision, R.JobState.BUILD_REQUESTED)  # 50<=50 still
+
+  def test_all_over_bar_all_deferred(self):
+    es = [self._q('a'), self._q('b')]
+    out = self._plan(es, 10.0, {'a': 100.0, 'b': 100.0})
+    self.assertTrue(all(d.decision == R.JobState.BUDGET_DEFERRED for d in out))
+
+  def test_zero_headroom_defers_paid_admits_exempt(self):
+    es = [self._q('paid'), self._q('ex')]
+    out = self._plan(es, 0.0, {'paid': 1.0, 'ex': 1.0}, exempt={'ex'})
+    by = {d.job_id: d.decision for d in out}
+    self.assertEqual(by['paid'], R.JobState.BUDGET_DEFERRED)
+    self.assertEqual(by['ex'], R.JobState.BUILD_REQUESTED)
+
+  def test_exact_fit_admitted(self):
+    es = [self._q('a')]
+    out = self._plan(es, 50.0, {'a': 50.0})
+    self.assertEqual(out[0].decision, R.JobState.BUILD_REQUESTED)  # <= is inclusive
+    self.assertAlmostEqual(out[0].headroom_after, 0.0)
+
+
 if __name__ == '__main__':
   unittest.main()
