@@ -1,6 +1,6 @@
 
 
-load("//devtools/python/blaze:pytype.bzl", "pytype_binary", "pytype_strict_binary")
+load("//devtools/python/blaze:pytype.bzl", "pytype_binary", "pytype_strict_binary", "pytype_strict_library")
 
 pytype_strict_binary(
     name = "quota_check",
@@ -13,10 +13,16 @@ pytype_strict_binary(
     ],
 )
 
+pytype_strict_library(
+    name = "cap_policy",
+    srcs = ["cap_policy.py"],
+)
+
 pytype_strict_binary(
     name = "money_check",
     srcs = ["money_check.py"],
     deps = [
+        ":cap_policy",
         ":group_utils",
         "//devtools/production/pyspanner:pyspanner",
         "//experimental/users/qiaos/tpu_utils/preflight:market",
@@ -160,7 +166,41 @@ pytype_strict_binary(
     ],
 )
 
+pytype_strict_binary(
+    name = "dump_wu_status",
+    srcs = ["dump_wu_status.py"],
+    deps = [
+        "//learning/deepmind/xmanager2/client:xmanager_api",
+    ],
+)
+
 # --- Local-queue router --------------------------------------------------
+# THE cell -> (metro, continent, campus) snapshot, MEASURED with
+# `mach_locality` and regenerable by remeasure_cell_locality.py. A
+# dependency-free leaf (stdlib only, no I/O at import) so every layer that has
+# an opinion about where a cell is -- both routers, the launcher, and the
+# training binaries -- can import the same rows and cannot drift apart.
+#
+# It replaced 70 hand-written tables across nine checkouts. An unknown cell
+# resolves to the UNKNOWN sentinel and the *_or_die helpers raise; nothing here
+# ever guesses a metro from a cell's name (that heuristic was measured wrong for
+# 26 of 57 cells).
+pytype_strict_library(
+    name = "cell_locality",
+    srcs = ["cell_locality.py"],
+)
+
+# Cell -> metro resolution. A thin fail-closed facade over :cell_locality, kept
+# as its own target because both routers (the smart-cell default via
+# avail_provider, and the --power router via preflight:router) import this name.
+pytype_strict_library(
+    name = "metro_util",
+    srcs = ["metro_util.py"],
+    deps = [
+        ":cell_locality",
+    ],
+)
+
 # Pure scheduling core: queue schema, placement, priority/fairness, topology
 # lock, effective-price type selection. No I/O, no RPC -- unit-tested in full.
 pytype_strict_library(
@@ -185,6 +225,7 @@ pytype_strict_library(
     name = "avail_provider",
     srcs = ["avail_provider.py"],
     deps = [
+        ":metro_util",
         ":route_lib",
         "//borg/common:scalar_resource_py_pb2",
         "//borg/xborg/frontend/goodput_optimizer/proto:goodput_optimizer_service_py_pb2",
@@ -295,5 +336,84 @@ pytype_strict_contrib_test(
     deps = [
         ":pick_cell_lib",
         ":route_lib",
+    ],
+)
+
+# --- the rewritten scheduler (infra-v12, 2026-08-28) ------------------------
+# One job, one chain. See jobchain.py for the invariant table; every one of them
+# is a fix for a measured incident, not a hypothetical.
+
+pytype_strict_library(
+    name = "jobchain",
+    srcs = ["jobchain.py"],
+    deps = [":cell_locality"],
+)
+
+pytype_strict_library(
+    name = "jobstore",
+    srcs = ["jobstore.py"],
+    deps = [":jobchain"],
+)
+
+pytype_strict_library(
+    name = "jobcost",
+    srcs = ["jobcost.py"],
+)
+
+pytype_strict_library(
+    name = "jobplace",
+    srcs = ["jobplace.py"],
+    deps = [
+        ":cell_locality",
+        ":jobchain",
+    ],
+)
+
+pytype_strict_library(
+    name = "jobbuild",
+    srcs = ["jobbuild.py"],
+    deps = [
+        ":jobchain",
+        ":jobplace",
+    ],
+)
+
+pytype_strict_library(
+    name = "jobmigrate",
+    srcs = ["jobmigrate.py"],
+    deps = [
+        ":jobchain",
+        ":jobstore",
+    ],
+)
+
+pytype_strict_library(
+    name = "jobdispatch",
+    srcs = ["jobdispatch.py"],
+    deps = [
+        ":jobbuild",
+        ":jobchain",
+        ":jobcost",
+        ":jobplace",
+        ":jobstore",
+    ],
+)
+
+# The daemon entry point. Depends on avail_provider for live capacity, which is
+# what pulls in the goodput-optimizer protos that a bare `python3 jobd.py`
+# cannot resolve.
+pytype_strict_binary(
+    name = "jobd",
+    srcs = ["jobd.py"],
+    deps = [
+        "//third_party/py/absl:app",
+        "//third_party/py/absl/flags:flags",
+        ":avail_provider",
+        ":jobbuild",
+        ":jobchain",
+        ":jobcost",
+        ":jobdispatch",
+        ":jobplace",
+        ":jobstore",
     ],
 )
