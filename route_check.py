@@ -61,8 +61,16 @@ class _Submitter(Protocol):
 # Live scheduling states for a submitted XID, collapsed to what re-route needs.
 STATUS_PENDING = 'PENDING'     # still in the auction -- the re-route trigger
 STATUS_RUNNING = 'RUNNING'     # scheduled/coming up/running -- leave it alone
-STATUS_TERMINAL = 'TERMINAL'   # failed/completed/cancelled -- stop tracking
+STATUS_TERMINAL = 'TERMINAL'   # ended BADLY (failed/stopped/cancelled) -- zombie
+STATUS_COMPLETED = 'COMPLETED'  # ended WELL (ran to completion) -- NOT a failure
 STATUS_UNKNOWN = 'UNKNOWN'     # probe failed -- do NOT act (never cancel blind)
+
+# NOTE: TERMINAL and COMPLETED were ONE constant until it was found that
+# reconcile wrote FAILED for every job that merely finished: 105 of 227 queue
+# rows carried 'zombie cleaned up' and 100% of them read FAILED, including runs
+# with confirmed results. The distinction is made HERE, at the probe, because
+# once is_failed/is_completed are OR-ed together the information is gone and no
+# downstream decision can recover it.
 
 
 class _StatusProbe(Protocol):
@@ -86,7 +94,17 @@ class _OutputProbe(Protocol):
 DEFAULT_QUEUE_FILE = os.path.expanduser('~/.tpu_local_queue.json')
 # The wrapper defining the `tpu` shell function; we source it, then call `tpu`.
 TPU_WRAPPER = os.path.expanduser('~/work/tpu_cmd/tpu_wrapper.sh')
+# The XManager CLI, by ABSOLUTE path: `xmanager` is a shell function and
+# `xmanager.par` is not on PATH, so a bare name exits 127 -- which, behind a
+# pipe, is indistinguishable from "the experiment does not exist".
+XMANAGER_PAR = '/google/bin/releases/xmanager/cli/xmanager.par'
 DEFAULT_GROUP = '9'
+# ★Preference order for placement (operator standing order 2026-08-31): the
+# operator's OWN pools g5/g3 first -- they are exempt from the G9 income/10 cap
+# and self-limit at 100% of their own income (an overspend there parks itself,
+# nobody is on the hook) -- and only then the g9 floor, whose 1/10 ceiling is
+# the one a human answers for. "优先" means TRY IN THIS ORDER, per job.
+DEFAULT_GROUP_ORDER = ['5', '3', '9']
 
 # Same acceptance the wrapper uses (ANSI-stripped): XManager prints "Launched
 # experiment <id>" on create and "Added N work unit(s) to experiment <id>" on
@@ -283,7 +301,18 @@ def merge_and_save_touched(
         seen.add(e.job_id)
         continue
       if e.job_id in touched_by_id:
-        merged.append(touched_by_id[e.job_id])
+        t = touched_by_id[e.job_id]
+        # ★Do NOT let a stale snapshot erase the ROUTER's group choice.
+        # This pass read its snapshot before its (slow) XM RPCs; meanwhile the
+        # dispatch worker may have admitted the row under g5/g3 and written
+        # `group` onto it. Our copy still has the pre-RPC value (None), so a
+        # blind overwrite silently reverts the placement preference -- measured
+        # 2026-08-31 02:1xZ: dispatch logged "-> group g5" for three cars and
+        # the reconcile pass wrote all three back as group=None.
+        # A field the pass does not own must be carried over from the LIVE row.
+        if getattr(t, 'group', None) is None and getattr(e, 'group', None):
+          t.group = e.group
+        merged.append(t)
       else:
         merged.append(e)
       seen.add(e.job_id)
@@ -296,7 +325,7 @@ def merge_and_save_touched(
 
 def claim_next_build(path: str, now: float, worker_id: str,
                      stale_after_s: float,
-                     pick: 'Callable[[list[route_lib.QueueEntry]], Optional[route_lib.QueueEntry]]' = None
+                     pick: 'Optional[Callable[[list[route_lib.QueueEntry]], Optional[route_lib.QueueEntry]]]' = None
                      ) -> Optional[route_lib.QueueEntry]:
   """Atomically: reclaim stale BUILDING, then IF no live build is in flight,
   mark the next claimable entry BUILDING and persist. Returns the claimed entry
@@ -345,6 +374,23 @@ def update_entry(path: str, job_id: str,
 
 
 # --- pure helpers ---------------------------------------------------------
+def _decode_stream(s) -> str:
+  """`TimeoutExpired.stdout` is bytes even when the run asked for text."""
+  if s is None:
+    return ''
+  if isinstance(s, bytes):
+    return s.decode('utf-8', 'replace')
+  return str(s)
+
+
+def _exp_name_of(argv: list[str]) -> Optional[str]:
+  """The `--exp_name=` value in a `tpu queue` argv, or None."""
+  for a in argv or []:
+    if a.startswith('--exp_name='):
+      return a.split('=', 1)[1]
+  return None
+
+
 def build_tpu_queue_cmd(placement: route_lib.Placement,
                         entry: route_lib.QueueEntry,
                         group: str = DEFAULT_GROUP) -> list[str]:
@@ -361,6 +407,15 @@ def build_tpu_queue_cmd(placement: route_lib.Placement,
   if entry.tier:
     argv.append(f'--tier={entry.tier}')
   for k, v in (entry.launch_kwargs or {}).items():
+    # ★`group` is the ROUTER's decision, not a passthrough. Many rows carry a
+    # stale launch_kwargs['group']='9' from whoever enqueued them (88 of 225
+    # rows, 2026-08-31), and emitting it here appends a SECOND --group= after
+    # the router's -- so the caller's g9 silently wins and the operator's
+    # "prefer g5/g3" preference is a no-op for exactly those jobs. The router
+    # already resolved the group (g5 -> g3 -> g9) against each pool's live
+    # budget gate; drop the passthrough copy rather than emit a duplicate flag.
+    if k.lstrip('-') == 'group':
+      continue
     flag = k if k.startswith('--') else f'--{k}'
     if v is None or v is True:
       argv.append(flag)
@@ -369,6 +424,11 @@ def build_tpu_queue_cmd(placement: route_lib.Placement,
     else:
       argv.append(f'{flag}={v}')
   return argv
+
+
+_STDERR_MARK = '\n\x00--stderr--\n'
+"""Separates the stdout and stderr halves inside a submit's combined output.
+NUL cannot occur in either stream's text, so the split is unambiguous."""
 
 
 def extract_xid(output: str) -> Optional[str]:
@@ -416,9 +476,83 @@ class Submitter:
       proc = subprocess.run(['bash', '-c', script], capture_output=True,
                             text=True, timeout=self.timeout_s, cwd=run_cwd)
     except subprocess.TimeoutExpired as e:
-      return None, f'[route_check] tpu queue TIMED OUT after {self.timeout_s}s: {e}'
-    out = (proc.stdout or '') + (proc.stderr or '')
+      # ★A TIMEOUT IS NOT EVIDENCE THAT NOTHING WAS SUBMITTED. `tpu queue`
+      # creates the experiment early and then blocks for minutes on the build,
+      # so a timeout most often means "submitted, then we stopped watching".
+      # Returning None here made the worker count a failed attempt and RESUBMIT:
+      # the first XID then ran with no local row (invisible to every self-check
+      # that walks the queue) while a second copy burned the same quota twice --
+      # and the wasted spend pushed OTHER lines' jobs over the budget bar.
+      # Same trap as cancellation: LOCAL FAILURE IS NOT REMOTE ABSENCE.
+      return self._recover_timed_out_xid(e, argv)
+    # ★Mark where stdout ends. `tpu queue` prints a ~400-char deprecation banner
+    # to STDERR on every invocation, so a plain concatenation puts a fixed banner
+    # AFTER the real error and any tail-excerpt returns only the banner. _tail()
+    # splits on this marker and prefers stdout. Keep the marker in the string
+    # (not a separate field) so the Submitter protocol and its fakes are unchanged.
+    out = (proc.stdout or '') + _STDERR_MARK + (proc.stderr or '')
     return extract_xid(out), out
+
+  def _recover_timed_out_xid(
+      self, exc: subprocess.TimeoutExpired,
+      argv: list[str]) -> tuple[Optional[str], str]:
+    """After a submit timeout, find out whether the experiment EXISTS anyway.
+
+    Two probes, cheapest first:
+      1. the partial output captured before the timeout -- `tpu queue` prints
+         `Experiment id: N` long before it returns, so this usually settles it
+         at zero cost (subprocess.TimeoutExpired carries .stdout/.stderr);
+      2. an XM lookup by `--experiment_name`, for the case where the timeout
+         landed before the id was flushed.
+    Only when BOTH come back empty do we report 'no XID' -- and then in words
+    that do not claim the submit failed.
+    """
+    partial = _decode_stream(exc.stdout) + _STDERR_MARK + _decode_stream(exc.stderr)
+    note = f'[route_check] tpu queue TIMED OUT after {self.timeout_s}s'
+
+    xid = extract_xid(partial)
+    if xid:
+      return xid, (f'{note}, but the experiment WAS created: xid={xid} '
+                   f'recovered from output captured before the timeout. '
+                   f'Adopting it instead of resubmitting.\n{partial}')
+
+    exp_name = _exp_name_of(argv)
+    if exp_name:
+      found, how = self.find_xid_by_name(exp_name)
+      if found:
+        return found, (f'{note}, but XManager HAS an experiment named '
+                       f'{exp_name}: xid={found} ({how}). Adopting it instead '
+                       f'of resubmitting.\n{partial}')
+      note += f'; no XManager experiment named {exp_name} ({how})'
+    else:
+      note += '; no --exp_name to check XManager with, so remote state is UNKNOWN'
+
+    return None, f'{note}. Treating as not-submitted.\n{partial}'
+
+  def find_xid_by_name(self, exp_name: str,
+                       timeout_s: float = 120.0) -> tuple[Optional[str], str]:
+    """Newest XID whose experiment name matches EXACTLY, or (None, why).
+
+    `--experiment_name` matches a SUBSTRING, so the exact-match filter below is
+    load-bearing: `foo_v3` must not adopt `foo_v30`.
+    """
+    try:
+      p = subprocess.run(
+          [XMANAGER_PAR, 'list', f'--experiment_name={exp_name}',
+           '--archived=no', '--columns=ID,Name,CreateTime'],
+          capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+      return None, 'XM lookup itself timed out; remote state UNKNOWN'
+    except OSError as e:
+      return None, f'XM lookup could not run ({e}); remote state UNKNOWN'
+    rows = []
+    for ln in (p.stdout or '').splitlines():
+      f = ln.split()
+      if len(f) >= 2 and f[0].isdigit() and f[1] == exp_name:
+        rows.append(f[0])
+    if not rows:
+      return None, 'XM lookup ran and found no exact-name match'
+    return max(rows, key=int), f'XM lookup matched {len(rows)} experiment(s)'
 
   def cancel(self, xid: str) -> tuple[bool, str]:
     script = (f'source {_shquote(self.wrapper_path)} >/dev/null 2>&1; '
@@ -436,14 +570,22 @@ def _shquote(s: str) -> str:
 
 
 # --- the status-probe seam (for re-route) ---------------------------------
-def classify_wu_states(is_pending: bool, is_running: bool, is_terminal: bool
-                       ) -> str:
+def classify_wu_states(is_pending: bool, is_running: bool, is_terminal: bool,
+                       is_completed: bool = False) -> str:
   """Collapse an XManager work unit's booleans into one STATUS_*. Pure.
 
   A job scheduled but not yet training (PREPARING/STARTING) counts as RUNNING
   here: it has left the auction, so re-routing it would throw away a placement
   that is about to succeed. Only PENDING -- still bidding -- is the trigger.
+
+  `is_completed` splits the old single terminal bucket: a work unit that RAN TO
+  COMPLETION is STATUS_COMPLETED (a success -- reconcile must write DONE), while
+  failed/stopped/cancelled stays STATUS_TERMINAL (a real zombie -> FAILED).
+  Completion is checked FIRST because XManager can report a finished work unit
+  with both is_completed and is_stopped set; ending well outranks ending.
   """
+  if is_completed:
+    return STATUS_COMPLETED
   if is_terminal:
     return STATUS_TERMINAL
   if is_running:
@@ -482,18 +624,28 @@ class XManagerStatusProbe:
     # running/coming up, the placement took.
     states = []
     for wu in wus:
+      # is_completed is kept SEPARATE from the failure booleans. OR-ing it in
+      # here is what made every finished job read as a zombie: by the time the
+      # decision layer saw 'TERMINAL' the success/failure bit no longer existed.
+      is_completed = bool(getattr(wu, 'is_completed', False))
       is_terminal = bool(getattr(wu, 'is_failed', False)
-                         or getattr(wu, 'is_completed', False)
                          or getattr(wu, 'is_stopped', False))
       states.append(classify_wu_states(
           bool(getattr(wu, 'is_pending', False)),
           bool(getattr(wu, 'is_running', False)),
-          is_terminal))
+          is_terminal,
+          is_completed))
     if all(s == STATUS_PENDING for s in states):
       return STATUS_PENDING
     if any(s == STATUS_RUNNING for s in states):
       return STATUS_RUNNING
-    if all(s == STATUS_TERMINAL for s in states):
+    # Order matters below: a job is only COMPLETED if EVERY work unit completed.
+    # A mixed ending (some completed, some failed) is a FAILURE, not a success --
+    # so TERMINAL is tested as 'any', matching the pre-existing conservative
+    # bias that an ambiguous ending is never silently called a success.
+    if all(s == STATUS_COMPLETED for s in states):
+      return STATUS_COMPLETED
+    if all(s in (STATUS_TERMINAL, STATUS_COMPLETED) for s in states):
       return STATUS_TERMINAL
     return STATUS_RUNNING
 
@@ -601,7 +753,7 @@ def run_reconcile(
   if not targets:
     log.append('[reconcile] no non-terminal entries to reconcile.')
     return entries, log
-  n_zombie = n_promoted = n_unknown = n_noop = 0
+  n_zombie = n_promoted = n_unknown = n_noop = n_done = 0
   for e in targets:
     xid = e.xid
     if not xid:
@@ -620,6 +772,8 @@ def run_reconcile(
       log.append(f'[DRY][reconcile] would set {tag} -> {new_state.value}')
       if new_state == route_lib.JobState.FAILED:
         n_zombie += 1
+      elif new_state == route_lib.JobState.DONE:
+        n_done += 1
       else:
         n_promoted += 1
       continue
@@ -628,11 +782,15 @@ def run_reconcile(
       if e.state == route_lib.JobState.FAILED:
         n_zombie += 1
         log.append(f'[reconcile] {tag} -> FAILED (zombie cleaned up)')
+      elif e.state == route_lib.JobState.DONE:
+        n_done += 1
+        log.append(f'[reconcile] {tag} -> DONE (completed normally)')
       else:
         n_promoted += 1
         log.append(f'[reconcile] {tag} -> RUNNING (placement confirmed)')
   log.append(
       f'[reconcile] {len(targets)} checked: {n_zombie} zombie->FAILED, '
+      f'{n_done} completed->DONE, '
       f'{n_promoted} promoted->RUNNING, {n_unknown} UNKNOWN (left alone), '
       f'{n_noop} already-correct.')
   return entries, log
@@ -809,8 +967,60 @@ def run_tick(
 
 
 def _tail(s: str, n: int = 240) -> str:
-  s = (s or '').strip().replace('\n', ' | ')
-  return s[-n:]
+  """Excerpt a command's output for a one-line `last_reason`.
+
+  ★A pure tail is not a neutral excerpt -- it silently prefers whatever the
+  command prints LAST, so a tool that ends every invocation with a fixed banner
+  evicts the actual error DETERMINISTICALLY, not just unluckily. Measured
+  2026-08-30 (with elt-reproduction-v3, who proved the mechanism): `tpu queue`
+  writes a 399-char deprecation banner to stderr on every call, `Submitter.submit`
+  concatenated stderr last, and the window was 240 -- so 399 > 240 means a
+  tail-only excerpt could return *nothing but* the banner. Every build failure
+  fleet-wide recorded that banner instead of its cause from 2026-08-29 onward.
+
+  Three defences, because each alone is fragile:
+
+  1. **A `[[MARKER]]` verdict always wins.** `tpu_wrapper.sh` deliberately prints
+     `[[STAGE_SRC_REFUSED]]` / `[[STAGE_RSYNC_TIMEOUT]]` / `[[STAGE_RM_REFUSED]]`
+     as the LAST stderr line precisely so the old tail-240 would keep them, and
+     `budget_check.py` does the same with `[[BUDGET_DEFERRED]]`. Preferring stdout
+     (defence 2) would have thrown those away whenever stdout was non-empty --
+     replacing one silent-loss bug with another. So markers are hoisted first,
+     whichever stream they came from. ★When you retire a convention, carry the
+     things that were built to depend on it.
+  2. Otherwise prefer the STDOUT half, where the real error is.
+  3. Within the chosen text keep the HEAD as well as the tail: an error appears
+     at the start, the exit summary at the end, and the middle is progress
+     chatter. State how much was dropped so a reader can tell an excerpt from a
+     whole message.
+  """
+  s = s or ''
+  clean_all = _ANSI_RE.sub('', s)
+  markers = [ln.strip() for ln in clean_all.splitlines()
+             if ln.strip().startswith('[[') and ']]' in ln]
+  if _STDERR_MARK in s:
+    stdout_part, stderr_part = s.split(_STDERR_MARK, 1)
+    # Prefer stdout; fall back to stderr only when stdout carried nothing.
+    s = stdout_part if stdout_part.strip() else stderr_part
+  s = s.strip().replace('\n', ' | ')
+  prefix = ''
+  if markers:
+    # Hoist the verdict(s) to the front and give them the budget they need.
+    prefix = ' | '.join(markers)
+    if prefix not in s:
+      s = f'{prefix} | {s}' if s else prefix
+    elif not s.startswith(prefix):
+      s = f'{prefix} | {s}'
+  if len(s) <= n:
+    return s
+  # Never let the excerpt window truncate a hoisted verdict.
+  keep = max(n, len(prefix) + 40) if prefix else n
+  half = max(1, (keep - 20) // 2)
+  if prefix and half < len(prefix):
+    head = s[:len(prefix) + 1]
+    tail_budget = max(1, keep - len(head) - 20)
+    return f'{head} …[{len(s) - len(head) - tail_budget} chars cut]… {s[-tail_budget:]}'
+  return f'{s[:half]} …[{len(s) - 2 * half} chars cut]… {s[-half:]}'
 
 
 # --- the serial build-worker ----------------------------------------------
@@ -853,7 +1063,7 @@ def run_worker_once(
     srcfs_fail_brake: int = 20,
     last_fail_count: Optional[int] = None,
     max_build_attempts: int = 3,
-    claim_pick: 'Callable[[list[route_lib.QueueEntry]], Optional[route_lib.QueueEntry]]' = None,
+    claim_pick: 'Optional[Callable[[list[route_lib.QueueEntry]], Optional[route_lib.QueueEntry]]]' = None,
 ) -> tuple[str, list[str], Optional[int]]:
   """One worker step. Returns (outcome, log_lines, new_fail_count).
 
@@ -922,7 +1132,10 @@ def run_worker_once(
     return 'requeued', log, new_fail_count
 
   # BUILD + SUBMIT: the one build. build_tpu_queue_cmd + submit(cwd=workdir).
-  argv = build_tpu_queue_cmd(placement, claimed, group)
+  # ★Prefer the group the ROUTER admitted this job under (g5/g3 before g9).
+  # Falling back to the worker's global --group here is what made the whole
+  # preference a no-op before: dispatch chose g5, the builder submitted g9.
+  argv = build_tpu_queue_cmd(placement, claimed, getattr(claimed, 'group', None) or group)
   log.append(f'[worker] building {claimed.job_id}: {placement.reason} '
              f'(cwd={claimed.workdir or "router dir"})')
   xid, out = submitter.submit(argv, cwd=claimed.workdir or '')
@@ -1019,6 +1232,7 @@ def run_dispatch_once(
     group: str = DEFAULT_GROUP,
     budget_query_fn: 'Callable[..., Optional[dict]]' = budget_query,
     dry_run: bool = True,
+    group_order: Optional[list[str]] = None,
 ) -> tuple[str, list[str]]:
   """ONE router-dispatch round (the DISPATCH half of the rewritten worker).
 
@@ -1034,6 +1248,12 @@ def run_dispatch_once(
   route_lib.plan_dispatch; here we add the queue I/O and the budget seam.
   """
   log: list[str] = []
+  # Default preference: the operator's own exempt pools first, g9 floor last.
+  group_order = [g for g in (group_order or DEFAULT_GROUP_ORDER) if g]
+  if group_order[-1] != group:
+    # Always keep the caller's --group as the final fallback, so behaviour with
+    # a custom --group is unchanged when none of the preferred pools fit.
+    group_order = group_order + [group]
 
   # 1. promote deferred (under lock) so they re-test this round.
   with with_queue_lock(queue_file):
@@ -1061,7 +1281,9 @@ def run_dispatch_once(
   # 3. headroom (XM-truth). One query for the round's starting headroom; the
   #    per-candidate cost also comes from the seam, and plan_dispatch pre-debits
   #    in memory so we do not double-count within the round.
-  probe0 = budget_query_fn('v6e-16', 'PROD', '', group)  # any type: we want bar/current
+  # Headroom is a property of the G9 floor group (the pool with the income/10
+  # bar); the exempt pools do not consume it. Probe the LAST group in the order.
+  probe0 = budget_query_fn('v6e-16', 'PROD', '', group_order[-1])
   if probe0 is None:
     log.append('[dispatch] budget query unavailable -> fail SAFE: no dispatch '
                'this round (never guess headroom).')
@@ -1071,20 +1293,56 @@ def run_dispatch_once(
              f'current={probe0.get("current")}); {len(queued)} queued candidates.')
 
   # per-entry cost + exemption via the same seam (cached per type within round).
+  # ★GROUP PREFERENCE (operator 2026-08-31 00:05Z / 00:25Z, restated as a
+  # standing order): try g5, then g3, then g9 -- IN THAT ORDER, per job. g5/g3
+  # are the operator's own dynamic pools: they are EXEMPT from the G9
+  # income/10 cap (budget_check._EXEMPT_GROUP_IDS) and self-limit at 100% of
+  # their own income, so an overspend there parks itself and nobody has to
+  # watch it. G9 is the one with the hard 1/10 ceiling that a human is held to
+  # ("G9 超过 10% 我老板会骂我"), so it is the LAST resort, never the default.
+  # Before this, group_order existed only on the one-shot place path; the
+  # dispatch worker never read it, so all 82 rows went to g9 while g5/g3 sat at
+  # 0.0 chips with ~122k credits idle.
   _cost_cache: dict = {}
   def _type_of(e: route_lib.QueueEntry) -> str:
     if e.arch and e.chips:
       return f'{e.arch}-{e.chips}'
     return e.power
-  def _probe(e: route_lib.QueueEntry) -> dict:
-    key = (_type_of(e), e.tier or 'PROD')
+  def _probe_group(e: route_lib.QueueEntry, g: str) -> dict:
+    key = (_type_of(e), e.tier or 'PROD', g)
     if key not in _cost_cache:
-      _cost_cache[key] = budget_query_fn(key[0], key[1], '', group) or {}
+      _cost_cache[key] = budget_query_fn(key[0], key[1], '', g) or {}
     return _cost_cache[key]
+  def _pick_group(e: route_lib.QueueEntry) -> tuple:
+    """First group in `group_order` whose budget gate admits this job.
+
+    Returns (group, probe). Falls back to the LAST group in the order (the g9
+    floor) when none fits, so the job is budget-deferred against g9 exactly as
+    before -- the preference can only move a job to a cheaper pool, never make
+    a previously-placeable job unplaceable."""
+    last = (group_order[-1], {})
+    for g in group_order:
+      pr = _probe_group(e, g)
+      if not pr:
+        continue          # probe failed for this group: try the next one
+      last = (g, pr)
+      if pr.get('fits'):
+        return g, pr
+    return last
+  def _probe(e: route_lib.QueueEntry) -> dict:
+    return _pick_group(e)[1]
   def cost_of(e: route_lib.QueueEntry) -> float:
     return float(_probe(e).get('new_cost', 0.0))
   def is_exempt(e: route_lib.QueueEntry) -> bool:
     return bool(_probe(e).get('exempt', False))
+
+  # Remember which pool won for each candidate, so the BUILDER submits under it.
+  chosen: dict = {e.job_id: _pick_group(e)[0] for e in queued}
+  for e in queued:
+    g = chosen.get(e.job_id)
+    if g and g != group_order[-1]:
+      log.append(f'[dispatch] {e.job_id} -> group g{g} (exempt from the g9 '
+                 f'income/10 bar)')
 
   plan = route_lib.plan_dispatch(queued, headroom, cost_of, is_exempt)
 
@@ -1100,6 +1358,10 @@ def run_dispatch_once(
       if dry_run:
         continue
       if d.decision == route_lib.JobState.BUILD_REQUESTED:
+        # ★Carry the admitted group onto the row: dispatch and build are
+        # separate processes, so without this the builder falls back to its
+        # global --group (9) and the preference silently does nothing.
+        e.group = chosen.get(e.job_id) or e.group
         route_lib.mark_build_requested(e, d.reason); n_req += 1
       else:
         route_lib.mark_budget_deferred(e, d.reason); n_def += 1
@@ -1107,7 +1369,8 @@ def run_dispatch_once(
       save_queue(queue_file, live)
   if dry_run:
     for d in plan:
-      log.append(f'[DRY][dispatch] {d.job_id} -> {d.decision.value} ({d.reason})')
+      log.append(f'[DRY][dispatch] {d.job_id} -> {d.decision.value} '
+                 f'[group g{chosen.get(d.job_id, group_order[-1])}] ({d.reason})')
     return 'dispatched', log
   log.append(f'[dispatch] dispatched {n_req} -> BUILD_REQUESTED, '
              f'{n_def} -> BUDGET_DEFERRED.')
@@ -1153,6 +1416,7 @@ def run_dispatch_worker_loop(
     provider_factory: 'Callable[[], _Provider]',
     submitter: _Submitter,
     worker_id: str,
+    group_order: Optional[list[str]] = None,
     poll_s: float = 15.0,
     build_stale_s: float = 1800.0,
     group: str = DEFAULT_GROUP,
@@ -1183,7 +1447,8 @@ def run_dispatch_worker_loop(
     # 1. DISPATCH round.
     _, dlog = run_dispatch_once(
         queue_file, now=time.time(), group=group,
-        budget_query_fn=budget_query_fn, dry_run=False)
+        budget_query_fn=budget_query_fn, dry_run=False,
+        group_order=group_order)
     for line in dlog:
       print(line, flush=True)
     # 2. BUILD one BUILD_REQUESTED (serial). Claim from BUILD_REQUESTED so we
@@ -1238,6 +1503,8 @@ def main(argv):
         provider_factory=lambda: avail_provider.AvailabilityProvider(group=_GROUP.value),
         submitter=Submitter(),
         worker_id=worker_id,
+        group_order=([g.strip() for g in _GROUP_ORDER.value.split(',') if g.strip()]
+                     if _GROUP_ORDER.value else None),
         poll_s=_WORKER_POLL_S.value,
         build_stale_s=_BUILD_STALE_S.value,
         group=_GROUP.value,

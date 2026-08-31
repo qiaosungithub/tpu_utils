@@ -24,6 +24,11 @@ from google3.experimental.users.qiaos.tpu_utils.preflight import router
 _POWER   = flags.DEFINE_string('power', '', "e.g. 'v5p-32' or bare int '32'")
 _TIER    = flags.DEFINE_string('tier', 'PROD', 'PROD | BATCH')
 _GROUPS  = flags.DEFINE_string('groups', '', 'comma-separated group ids (default: all)')
+_METROS  = flags.DEFINE_string(
+    'metros', '',
+    'comma-separated metro allow-list for data-locality (e.g. "cbf,tul"). '
+    'When set, ONLY cells in those metros are recommended; a combo with no '
+    'in-metro cell is dropped. Empty = any metro (roam the fleet).')
 _TOP     = flags.DEFINE_integer('top', 3, 'return top-N recommendations')
 _TOL     = flags.DEFINE_float('tolerance', 0.5, 'fractional slack around target')
 _JSON    = flags.DEFINE_bool('json', False, 'emit JSON')
@@ -163,6 +168,8 @@ def main(argv):
       print('Error: --groups must be comma-separated ints', file=sys.stderr)
       return 2
 
+  metros = [m.strip() for m in _METROS.value.split(',') if m.strip()] or None
+
   progress = ((lambda s: print(f'  [router] {s}', file=sys.stderr))
               if _VERBOSE.value else None)
 
@@ -173,11 +180,12 @@ def main(argv):
     if want_all:
       ranked_all, snapshot = router.route_all(
           power=_POWER.value, tier=_TIER.value, groups=groups,
-          tolerance=_TOL.value, progress_fn=progress)
+          tolerance=_TOL.value, progress_fn=progress, metros=metros)
     else:
       ranked_all, snapshot = router.route(
           power=_POWER.value, tier=_TIER.value, groups=groups,
-          tolerance=_TOL.value, top_k=_TOP.value, progress_fn=progress)
+          tolerance=_TOL.value, top_k=_TOP.value, progress_fn=progress,
+          metros=metros)
   except Exception as e:  # pylint: disable=broad-except
     print(f'router error: {type(e).__name__}: {e}', file=sys.stderr)
     return 2

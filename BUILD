@@ -277,6 +277,20 @@ pytype_strict_contrib_test(
     ],
 )
 
+# G5/G3-first placement preference (operator standing order 2026-08-31).
+# Includes the negative control: when no pool fits, the g9 income/10 gate must
+# still defer -- a preference may only move a job to a cheaper pool, never widen
+# admission.
+pytype_strict_contrib_test(
+    name = "grouppref_test",
+    srcs = ["grouppref_test.py"],
+    deps = [
+        ":route_check_lib",
+        ":route_lib",
+        "//testing/pybase",
+    ],
+)
+
 # Local-queue CLI: `tpu enqueue` / `tpu queue-status` / `tpu dequeue`. The
 # side-by-side smart-queue path; does NOT touch the existing one-shot `tpu
 # queue`. Thin arg-marshalling over route_lib (schema) + route_check (queue
@@ -415,5 +429,44 @@ pytype_strict_binary(
         ":jobdispatch",
         ":jobplace",
         ":jobstore",
+    ],
+)
+
+pytype_strict_binary(
+    name = "v16_realfetch",
+    srcs = ["v16_realfetch.py"],
+    deps = [
+        ":avail_provider",
+        "//third_party/py/absl:app",
+    ],
+)
+
+pytype_strict_contrib_test(
+    name = "grouppersist_test",
+    srcs = ["grouppersist_test.py"],
+    deps = [
+        ":route_check_lib",
+        ":route_lib",
+        "//testing/pybase",
+    ],
+)
+
+pytype_strict_contrib_test(
+    name = "reconcilecomplete_test",
+    srcs = ["reconcilecomplete_test.py"],
+    deps = [
+        ":route_check_lib",
+        ":route_lib",
+        "//testing/pybase",
+    ],
+)
+
+pytype_strict_contrib_test(
+    name = "groupdup_test",
+    srcs = ["groupdup_test.py"],
+    deps = [
+        ":route_check_lib",
+        ":route_lib",
+        "//testing/pybase",
     ],
 )

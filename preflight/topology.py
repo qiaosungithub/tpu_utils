@@ -46,6 +46,31 @@ _LOCUS_TABLE: dict[str, dict[int, str]] = {
     'v4lite': {},  # Explicitly no support; historically rejects slice=8.
 }
 
+# NVIDIA GPUs are NOT a torus. There is no locus SHAPE string to validate the
+# way a TPU 2x4x4 must be checked -- Borg takes a scalar device count plus an
+# NVLink-domain grouping the allocator resolves. So the "legal shape" here is
+# simply the chip count, and the value we carry is the scalar as a string
+# (used only for display / the request kwarg, never remapped to a torus).
+#
+# The cap in each dict is the card's NVLINK DOMAIN (device_group in the
+# platform GCL, platforms/accelerator_metadata/platforms/*.gcl): the largest
+# single-node fully-NVLink-connected slice. Larger asks ARE legal (chips talk
+# over network RDMA past the domain) but are the caller's responsibility, so we
+# whitelist the common in-domain sizes and let anything bigger fall to the L2
+# capacity check rather than hard-blocking here.
+_GPU_LEGAL: dict[str, dict[int, str]] = {
+    'a100':       {1: '1', 2: '2', 4: '4', 8: '8', 16: '16'},        # domain 16
+    'a100_80gib': {1: '1', 2: '2', 4: '4', 8: '8'},                  # domain 8
+    'h100':       {1: '1', 2: '2', 4: '4', 8: '8'},                  # domain 8
+    'h200':       {1: '1', 2: '2', 4: '4', 8: '8'},                  # domain 8
+    'b200':       {1: '1', 2: '2', 4: '4', 8: '8'},                  # domain 8
+    'b300':       {1: '1', 2: '2', 4: '4', 8: '8'},                  # domain 8
+    'gb200':      {1: '1', 2: '2', 4: '4', 8: '8', 16: '16', 32: '32', 64: '64', 72: '72'},  # NVL72
+    'gb300':      {1: '1', 2: '2', 4: '4', 8: '8', 16: '16', 32: '32', 64: '64', 72: '72'},  # NVL72
+}
+_GPU_ARCHS = frozenset(_GPU_LEGAL)
+_LOCUS_TABLE.update(_GPU_LEGAL)
+
 # Borg ScalarResource.Key enum name for each arch. Used when calling
 # GoodputService.GetCellAvailability.
 BORG_PLATFORM_KEY: dict[str, str] = {
@@ -56,6 +81,15 @@ BORG_PLATFORM_KEY: dict[str, str] = {
     'v5e': 'VIPERLITE_POD',
     # GHOSTFISHLITE (101) is v7, NOT v5e/v6e -- see quota_check.py's note.
     'v7': 'GHOSTFISHLITE',
+    # NVIDIA GPUs: ScalarResource.Key enum names, for GetCellAvailability.
+    'a100': 'GPU_TESLA_A100_40GIB',
+    'a100_80gib': 'GPU_TESLA_A100_80GIB',
+    'h100': 'GPU_NVIDIA_H100',
+    'h200': 'GPU_NVIDIA_H200',
+    'b200': 'GPU_NVIDIA_B200',
+    'b300': 'GPU_NVIDIA_B300',
+    'gb200': 'GPU_NVIDIA_GB200',
+    'gb300': 'GPU_NVIDIA_GB300',
 }
 
 # XManager-side codenames used by xm.JobRequirements() (matches money_check.py
@@ -67,6 +101,16 @@ XM_ACCELERATOR_KEY: dict[str, str] = {
     'v6e': 'tpu_ghostlite_pod',
     'v5e': 'tpu_viperlite_pod',
     'v7': 'tpu_ghostfishlite',
+    # NVIDIA GPUs: proto field names in the ResourceSet (resource_model.proto),
+    # matching quota_check.GPU_DISPLAY_NAMES keys.
+    'a100': 'gpu_a100',
+    'a100_80gib': 'gpu_a100_80gib',
+    'h100': 'gpu_h100',
+    'h200': 'gpu_h200',
+    'b200': 'gpu_b200',
+    'b300': 'gpu_b300',
+    'gb200': 'gpu_gb200',
+    'gb300': 'gpu_gb300',
 }
 
 # Per-allocator hard minimum slice size overrides. These are POOL POLICIES,

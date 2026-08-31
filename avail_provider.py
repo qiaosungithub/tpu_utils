@@ -22,10 +22,14 @@ imports in a bare interpreter for those tests.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
+import re
+import sys
 from typing import Any, Callable, Optional
 
+from google3.experimental.users.qiaos.tpu_utils import metro_util
 from google3.experimental.users.qiaos.tpu_utils import route_lib
 
 
@@ -40,6 +44,19 @@ ARCH_PLATFORM: dict[str, str] = {
     'v6e': 'GHOSTLITE_POD',   # 76 (63 is the same fleet, GHOSTLITE)
     'v6p': 'GHOSTFISH',       # 92
     'v7': 'GHOSTFISHLITE',    # 101
+    # NVIDIA GPUs. Enum names verified against borg/common/scalar_resource.proto;
+    # values (46/66/70/86/87/112/89/100) match the proto's ScalarResource.Key.
+    'a100': 'GPU_TESLA_A100_40GIB',   # 46
+    'a100_80gib': 'GPU_TESLA_A100_80GIB',  # 66
+    'h100': 'GPU_NVIDIA_H100',        # 70
+    'h200': 'GPU_NVIDIA_H200',        # 86
+    'b200': 'GPU_NVIDIA_B200',        # 87
+    'b300': 'GPU_NVIDIA_B300',        # 112
+    # gb200 (89) / gb300 (100) are NOT resolvable: the operator's directive forbids this
+    # group from using them, so the router must not be able to name a GB slice at all.
+    # ★Removing them here makes an unknown-arch lookup fail; it does NOT relax a cap.
+    # Contrast tpu_wrapper.sh's `gb200) echo "20"`, which is a limit-PRICE and whose
+    # deletion would leave the family UNCAPPED -- that one stays.
 }
 
 # arch -> card codes in market.json price keys (first present wins for price).
@@ -49,6 +66,8 @@ ARCH_CARDS: dict[str, list[int]] = {
     'v6e': [76, 63],
     'v6p': [92],
     'v7': [101],
+    'a100': [46], 'a100_80gib': [66], 'h100': [70], 'h200': [86],
+    'b200': [87], 'b300': [112],   # gb200/gb300 withdrawn: see above
 }
 
 # The alloc/group the router submits under (same as slice_probe --group=9).
@@ -68,35 +87,36 @@ _GROUP_MAP = {
 DEFAULT_MARKET_JSON = os.path.expanduser('~/.tpu_quota_cache_dir/market.json')
 DEFAULT_PRICE_POOL = 'deepmind-dynamic-pool'
 
-# Cells whose metro is not recoverable from the `yu<metro>...` name pattern.
-# Seeded from xm_launcher._CELL_BUCKETS. Only consulted when a job opts into an
-# allowed-metros filter; the default (empty filter) never needs it.
-_METRO_OVERRIDES: dict[str, str] = {
-    'dl': 'las',   # las -> dl-d  (2nd v4 cell)
-    'je': 'cbf',   # cbf neighbour
-    'nl': 'tul',   # tul neighbour
-    'nk': 'tul',   # tul neighbour
-    'el': 'grq',
-    'mb': 'ckv',
-    'sk': 'sin', 'sn': 'sin', 'so': 'sin',
-}
+# Cell -> metro resolution lives in the dependency-free ``metro_util`` leaf,
+# itself a facade over the MEASURED ``cell_locality`` snapshot, so the --power
+# router (``preflight.router``) and this smart-cell path agree on it exactly.
+# Re-exported under the historical names for existing callers/tests.
+_METRO_OVERRIDES = metro_util.METRO_OVERRIDES
+metro_of = metro_util.metro_of
+
+# The string a CellAvail carries when the cell's metro was never measured.
+#
+# WHY A STRING AND NOT THE SENTINEL. ``CellAvail.metro`` is typed ``str`` and
+# ``route_lib.best_cell_for_shape`` calls ``.lower()`` on it unconditionally, so
+# putting the sentinel object in the field would turn an unknown cell into an
+# AttributeError deep inside the placement loop -- a crash, not a decision. This
+# marker is a string that can never equal a real metro (metros are three lowercase
+# letters), so an ``--metro`` allow-list DROPS the cell, which is the fail-closed
+# direction: an unmeasurable cell is never silently treated as in-metro.
+#
+# It is deliberately NOT '' -- an empty metro would read as "no constraint" to a
+# future filter written the other way round, and '' is what a missing field looks
+# like. This value announces itself in any log line that prints it.
+UNMEASURED_METRO = '__unmeasured__'
 
 
-def metro_of(cell: str) -> str:
-  """Best-effort metro token for a borg cell name.
+def metro_str(cell: str) -> str:
+  """``metro_of`` coerced to a str for ``CellAvail.metro``, never guessing.
 
-  The fleet's full cell names encode the metro as `yu<metro><suffix>`
-  (yutulpz -> tul, yulpptr -> lpp, yucbfiv -> cbf, yudfwra -> dfw,
-  yuskedq -> ske). Short/legacy names fall back to an override table, then to
-  the cell name itself. Metro precision only matters when a job sets
-  allowed_metros; by default there is no metro filter.
+  Unknown -> ``UNMEASURED_METRO``, which no allow-list can match.
   """
-  c = (cell or '').lower()
-  if c in _METRO_OVERRIDES:
-    return _METRO_OVERRIDES[c]
-  if c.startswith('yu') and len(c) >= 5:
-    return c[2:5]
-  return c
+  m = metro_of(cell)
+  return UNMEASURED_METRO if m is metro_util.UNKNOWN else str(m)
 
 
 def load_prices(market_json_path: str = DEFAULT_MARKET_JSON,
@@ -175,9 +195,140 @@ def build_availability(
       pool += max(0, free_chips)
       avail_by_cell[f'{cell}|{arch}'] = route_lib.CellAvail(
           cell=cell, arch=arch, free_chips=free_chips, oversold=oversold,
-          price=price, metro=metro_of(cell))
+          price=price, metro=metro_str(cell))
     arch_pool[arch] = float(pool)
   return avail_by_cell, arch_price, arch_pool
+
+
+# --- half-initialised module recovery ---------------------------------------
+# ★A transient gRPC failure inside a LAZY import pins a long-lived worker
+# FOREVER, and it disguises itself as "waiting for capacity": the router logs
+# `availability fetch failed`, keeps the job QUEUED, never increments attempts,
+# never bills, and the fleet stalls with nothing marked broken.
+#
+# MECHANISM, measured against the live RPC (not inferred):
+# A generated `*_pb_stubby.py` sets, at MODULE level,
+#     try:  _client_stub_base_class = proto_python_api_2_stub.Stub
+#     except ImportError: _client_stub_base_class = object
+# When the RPC stack is half-imported, that line raises AttributeError, which
+# the `except ImportError` does NOT catch -- so the stubby module itself dies
+# mid-body and every later call raises
+#     NameError: name '_client_stub_base_class' is not defined
+# Python never re-runs an import that is already in sys.modules, so the process
+# is poisoned for good.
+#
+# ★THE FIX IS RELOAD-IN-PLACE, NOT EVICTION. Dropping the modules from
+# sys.modules and re-importing MEASURABLY DOES NOT WORK: the cached
+# `*_pb2.GoodputService` class holds `__globals__` pointing at the OLD module
+# dict, so a fresh import builds a second dict nobody references and the stale
+# class keeps raising. `importlib.reload()` re-executes the body in the SAME
+# dict, which is the one the cached class reads. Verified end to end against
+# blade:xborg-prod-routing-layer: poison 711 attrs -> evict+reimport still
+# NameError -> reload-in-place recovers 206 cells.
+#
+# ★THE DISCRIMINATOR: AttributeError or NameError => the module EXISTS but is
+#   INCOMPLETE, i.e. a poisoned PROCESS, not a version mismatch -- do NOT go
+#   chasing library versions. An ImportError means the dependency is genuinely
+#   absent and a reload cannot help; let it propagate.
+# Corroborating signal: the first failure differs from every later one, and a
+# FRESH process succeeds.
+_HALF_INIT_MODULE_HINTS = (
+    'stubby',
+    'grpc',
+    'rpc',
+    'net.rpc',
+)
+
+
+_HALF_INIT_RE = re.compile(r"module '([A-Za-z0-9_.]+)' has no attribute")
+# The stubby module's own body died partway, so a module-level name it was
+# supposed to bind is missing. This is the shape actually observed live.
+_HALF_INIT_NAME_RE = re.compile(r"name '([A-Za-z0-9_]+)' is not defined")
+
+
+def _looks_half_initialised(exc: BaseException) -> bool:
+  """True iff `exc` is the 'module exists but is incomplete' shape.
+
+  ONLY AttributeError (attribute never populated) and NameError (module body
+  died before binding a module-level name) qualify. An ImportError means the
+  module is genuinely absent -- reloading and retrying would just burn a second
+  RPC deadline and hide the real error.
+  """
+  if isinstance(exc, ImportError):  # ModuleNotFoundError included
+    return False
+  if isinstance(exc, NameError):
+    return _HALF_INIT_NAME_RE.search(str(exc)) is not None
+  if not isinstance(exc, AttributeError):
+    return False
+  return _poisoned_module_name(exc) is not None
+
+
+def _poisoned_module_name(exc: BaseException) -> Optional[str]:
+  """The module named by an AttributeError, e.g. `...base_stubby_api`, or None."""
+  m = _HALF_INIT_RE.search(str(exc))
+  return m.group(1) if m else None
+
+
+def _is_generated_proto(name: str) -> bool:
+  """Generated `_pb2` protos are NEVER reloaded: re-executing one duplicates
+  descriptor-pool entries and raises, turning a recoverable stall into a hard
+  crash. Their `_pb_stubby` siblings are safe and ARE reloaded -- that is where
+  the poison actually sits."""
+  return '_pb2' in name.lower()
+
+
+def _reload_candidates(seed: Optional[str]) -> list[str]:
+  """Live RPC-stack modules to re-execute in place.
+
+  Wider than just the module named in the message, because a module that DID
+  finish importing still holds a reference to the broken one:
+    1. the seed module named by the error, plus its submodules;
+    2. every RPC-stack module (`_HALF_INIT_MODULE_HINTS`);
+  both excluding generated protos and `None` tombstones (a tombstone has no
+  module object to reload; it is dropped separately).
+  """
+  victims: set[str] = set()
+  for name, mod in list(sys.modules.items()):
+    if mod is None or _is_generated_proto(name):
+      continue
+    if seed and (name == seed or name.startswith(seed + '.')):
+      victims.add(name)
+      continue
+    lowered = name.lower()
+    if any(h in lowered for h in _HALF_INIT_MODULE_HINTS):
+      victims.add(name)
+  return sorted(victims)
+
+
+def _tombstone_names() -> list[str]:
+  """`None` entries left in sys.modules by a failed import; safe to drop."""
+  return sorted(n for n, m in list(sys.modules.items()) if m is None)
+
+
+def _heal_half_initialised_modules(seed: Optional[str] = None) -> list[str]:
+  """Re-execute poisoned RPC modules IN PLACE. Returns the names healed.
+
+  In place (`importlib.reload`) rather than pop+reimport: the cached generated
+  service class reads the ORIGINAL module dict via `__globals__`, so a fresh
+  module object would leave it reading the stale one. Scoped to the RPC stack
+  on purpose -- reloading the world under a live worker is not recoverable.
+  """
+  healed: list[str] = []
+  for name in _tombstone_names():
+    sys.modules.pop(name, None)
+    healed.append(name)
+  for name in _reload_candidates(seed):
+    mod = sys.modules.get(name)
+    if mod is None:
+      continue
+    try:
+      importlib.reload(mod)
+      healed.append(name)
+    except Exception:  # pylint: disable=broad-except
+      # A module that refuses to reload is not fatal: the others may still
+      # restore the stack, and the retry will show whether it worked.
+      pass
+  return healed
 
 
 class AvailabilityProvider:
@@ -235,7 +386,27 @@ class AvailabilityProvider:
 
   # -- the live fetch -------------------------------------------------------
   def fetch(self) -> tuple[dict[str, route_lib.CellAvail], dict[str, float], dict[str, float]]:
-    """One RPC per arch -> the router's (avail_by_cell, arch_price, arch_pool)."""
+    """One RPC per arch -> the router's (avail_by_cell, arch_price, arch_pool).
+
+    Retries ONCE after re-executing half-initialised modules in place (see
+    `_looks_half_initialised`): a transient gRPC failure during a lazy import
+    otherwise pins a long-lived worker forever.
+    """
+    try:
+      return self._fetch_once()
+    except Exception as e:  # pylint: disable=broad-except
+      if not _looks_half_initialised(e):
+        raise
+      healed = _heal_half_initialised_modules(_poisoned_module_name(e))
+      print(f'[avail_provider] half-initialised module detected '
+            f'({type(e).__name__}: {e}); reloaded {len(healed)} module(s) in '
+            f'place and retrying once: {healed[:8]}', flush=True)
+      if not healed:
+        raise
+      return self._fetch_once()
+
+  def _fetch_once(self) -> tuple[dict[str, route_lib.CellAvail], dict[str, float], dict[str, float]]:
+    """The unguarded fetch. One RPC per arch."""
     stub = (self._stub_factory or self._default_stub)()
     resolve = self._alloc_resolver or self._resolve_alloc
     platform_of = self._platform_enum or self._platform_int
@@ -258,3 +429,4 @@ class AvailabilityProvider:
 
     arch_price = load_prices(self.market_json_path)
     return build_availability(per_arch, arch_price)
+

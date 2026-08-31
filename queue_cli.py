@@ -84,6 +84,18 @@ def _parse_launch_kwargs(items: list[str] | None) -> dict:
   return out
 
 
+# Metros where the GROUP has a CNS storage registration, and the two where it
+# does NOT. Mirrors xm_launcher.py:_METRO_STORAGE_CELL / _PERSONAL_ONLY_METROS.
+# Literal copies ON PURPOSE: importing the launcher would drag xmanager into
+# every enqueue. Safe because this is a REFUSAL list -- gaining an entry only
+# refuses more, and losing one is still caught by the launcher's own gate.
+# Verify: grep -A14 '_METRO_STORAGE_CELL = ' ~/work/tpu_cmd/xm_launcher.py
+GROUP_STORAGE_METROS = frozenset({
+    'cbf', 'ckv', 'cmh', 'dfw', 'grq', 'las', 'lpp', 'mrn', 'sin', 'tul',
+})
+PERSONAL_ONLY_METROS = frozenset({'phx', 'ske'})
+
+
 def _new_job_id(power: str) -> str:
   return f'{power}-{uuid.uuid4().hex[:6]}'
 
@@ -93,6 +105,31 @@ def _cmd_enqueue(argv: list[str]) -> int:
     print('enqueue: --power and --archs are REQUIRED.\n'
           '  e.g. tpu enqueue --power=v7-32 --archs=v7,v6p '
           '--launch=config=configs/eqr.py', file=sys.stderr)
+    return 2
+  # ★REFUSE personal-only metros here, at the moment the human typed them.
+  # phx / ske are metros the GROUP has no storage registration in, and they
+  # fail differently from every other bad metro: an unknown metro makes
+  # xm_launcher SystemExit into an inert zero-work-unit shell (visibly
+  # broken), whereas phx/ske RESOLVE -- the launch proceeds, bills, and writes
+  # to the personal 500 GiB quota (~468G used, handle poisoned) where the
+  # write fails with resource_exhausted AND STILL LEAVES A 0-BYTE FILE. The
+  # loss looks like a file that exists.
+  # This is the earliest of three gates (here, jobchain.validate_enqueue for
+  # the v2 store, and xm_launcher._local_bucket which nothing can bypass).
+  # Earliest matters: refusing at enqueue costs zero credits and zero XIDs.
+  personal = sorted({m.strip().lower() for m in (_METROS.value or [])}
+                    & PERSONAL_ONLY_METROS)
+  if personal:
+    print(f'enqueue: REFUSED -- metro(s) {personal} have NO group storage '
+          f'registration. Every write would land on the personal 500 GiB '
+          f'per-cell quota (~468G used, poisoned): it fails with '
+          f'resource_exhausted and still leaves a 0-byte file, so the job '
+          f'looks like it produced output.\n'
+          f'  Use a metro with group storage: '
+          f'{", ".join(sorted(GROUP_STORAGE_METROS))}\n'
+          f'  or pass an explicit group-billed bucket via '
+          f'--launch=bucket=/cns/<cell>/... if you chose this on purpose.',
+          file=sys.stderr)
     return 2
   job_id = _JOB_ID.value or _new_job_id(_POWER.value)
   # workdir default = the CWD at enqueue time, so enqueuing from the right
@@ -134,28 +171,100 @@ def _cmd_enqueue(argv: list[str]) -> int:
 
 
 def _cmd_dequeue(argv: list[str]) -> int:
+  """Remove queue entries — refusing the two states where removal does not stop
+  the work, because the queue row is not the job.
+
+  ★Dequeuing is bookkeeping, not cancellation. A BUILDING row has a worker
+  running `tpu queue` for it RIGHT NOW; deleting the row does not signal that
+  process, so the build finishes and submits an XID that no longer has any queue
+  entry pointing at it — an orphan nobody is watching. Measured 2026-08-30:
+  XID 284831213 ran 8xH100 for ~4 hours after its row was dequeued.
+  A row that already HAS an xid is the same hazard after the fact: the job is on
+  Borg, and removing the row only removes the evidence.
+
+  ★And the natural check for "did my dequeue work?" cannot see this. `tpu
+  queue-status | grep <id>` returning nothing is EXACTLY what a successful
+  dequeue and a dequeue-that-submitted-anyway both look like, because a running
+  job is not in the local queue either. So this command now prints the XID it
+  knows about and what to run to actually stop it — the check has to be against
+  XManager, never against the queue.
+  """
   ids = set()
   if _JOB_ID.value:
     ids |= {x.strip() for x in _JOB_ID.value.split(',')}
   ids |= {a for a in argv[1:] if not a.startswith('-')}
+  force = '--force' in argv[1:] or '-f' in argv[1:]
+  # ★--dry_run must PREVIEW, never delete (infra-v17, reported by elt-v5 which
+  # ran it "to be safe" and watched the queue go 215 -> 214). The flag was not
+  # parsed here at all: unknown flags are filtered out by the `not
+  # a.startswith('-')` above, so it was silently swallowed and the delete ran
+  # anyway -- printing "dequeued <id>" with rc=0. A preview that deletes is the
+  # worst failure direction there is: the caller chose it BECAUSE they were
+  # unsure, and every signal they get back says it worked.
+  # ★Read the FLAG, not argv: route_check defines --dry_run, so absl consumes it
+  # during parsing and it never reaches argv here. Scanning argv (the obvious
+  # implementation) therefore never fires -- which is exactly how the flag came
+  # to be silently ignored while the delete ran and printed rc=0.
+  # `present` distinguishes "user typed it" from route_check's default of True:
+  # keying off the value alone would turn EVERY dequeue into a no-op preview.
+  dry_run = (route_check._DRY_RUN.present and route_check._DRY_RUN.value) or any(
+      a in ('--dry_run', '--dry-run', '--dryrun', '-n') for a in argv[1:])
   if not ids:
     print('dequeue: pass job_id(s): tpu dequeue <job_id> [<job_id> ...]',
           file=sys.stderr)
     return 2
+  refused: list[tuple[str, str, str]] = []   # (job_id, state, xid)
   with route_check.with_queue_lock(_QUEUE_FILE.value):
     entries = route_check.load_queue(_QUEUE_FILE.value)
-    keep = [e for e in entries if e.job_id not in ids]
-    removed = [e.job_id for e in entries if e.job_id in ids]
-    if not removed:
+    targets = [e for e in entries if e.job_id in ids]
+    if not targets:
       print(f'dequeue: none of {sorted(ids)} found in the queue.', file=sys.stderr)
       return 1
-    route_check.save_queue(_QUEUE_FILE.value, keep)
+    unsafe = set()
+    if not force:
+      for e in targets:
+        # ★Compare the enum itself, never str(): JobState subclasses str, so
+        # `e.state == 'BUILDING'` is True, but `str(e.state)` renders
+        # 'JobState.BUILDING' and silently matches nothing. A guard written that
+        # way passes review, reads correctly, and refuses nothing.
+        raw = getattr(e, 'state', '')
+        state = getattr(raw, 'value', raw) or ''
+        xid = str(getattr(e, 'xid', '') or '')
+        if state == 'BUILDING' or xid:
+          unsafe.add(e.job_id)
+          refused.append((e.job_id, state, xid))
+    keep = [e for e in entries if e.job_id not in (ids - unsafe)]
+    removed = [e.job_id for e in targets if e.job_id not in unsafe]
+    if removed and not dry_run:
+      route_check.save_queue(_QUEUE_FILE.value, keep)
   for r in removed:
-    print(f'dequeued {r}')
-  missing = ids - set(removed)
+    print(f'[DRY] would dequeue {r}' if dry_run else f'dequeued {r}')
+  for job_id, state, xid in refused:
+    print(f'dequeue: REFUSED {job_id} (state={state or "?"}'
+          f'{", xid=" + xid if xid else ""}).', file=sys.stderr)
+    if state == 'BUILDING' and not xid:
+      print('  A worker is running its build NOW. Removing the row does not stop '
+            'it: the build will finish and submit an XID with no queue entry '
+            'behind it -- an orphan nobody is watching.', file=sys.stderr)
+      print('  Wait for it to reach SUBMITTED (tpu queue-status), then cancel by '
+            'XID; or --force to drop the row anyway and take responsibility for '
+            'the XID it produces.', file=sys.stderr)
+    else:
+      print(f'  This job is already on the cluster. Dequeuing removes the record, '
+            f'not the job. Stop it with:  tpu cancel {xid}', file=sys.stderr)
+  missing = ids - {e.job_id for e in targets}
   if missing:
     print(f'  (not found: {sorted(missing)})')
-  print(f'  queue now holds {len(keep)} job(s).')
+  if dry_run:
+    print(f'  [DRY RUN] queue NOT modified; it still holds {len(entries)} job(s). '
+          f'Re-run without --dry_run to act.')
+  else:
+    print(f'  queue now holds {len(keep)} job(s).')
+  if refused:
+    print('  ★Verify a cancellation against XManager, never against '
+          '`tpu queue-status`: a job that left the queue and a job that was '
+          'never stopped both show zero rows there.', file=sys.stderr)
+    return 1
   return 0
 
 

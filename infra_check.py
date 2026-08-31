@@ -1,11 +1,13 @@
 import argparse
 import concurrent.futures
 import datetime
+import functools
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 from absl import app
 from absl import flags
 from google3.experimental.users.qiaos.tpu_utils import group_utils
@@ -416,6 +418,31 @@ _STAT_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
 # How long the whole tail-fetching phase may take before we render without it.
 _LOG_TAIL_BUDGET_SEC = 8.0
+
+# Experiment fetch is now ONE batched list_experiments RPC (see main). Work
+# units are still fetched per experiment, so those RPCs are fanned out across
+# this pool: issued only from the main thread -- never from inside another
+# pool's worker -- so a dedicated pool cannot hit the nested-executor deadlock
+# the _CNS_POOL/_STAT_POOL split above guards against. The main thread bounds
+# the phase with a wall-clock deadline: a wedged work-unit RPC is dropped (its
+# row renders as unknown/unreadable, exactly as a serial exception would), so
+# one slow cell can never hang the table.
+_XM_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+
+# Whole-phase budget for the work-unit fan-out. Generous vs the per-RPC cost
+# (<1s healthy) but far under the 300s staleness alarm, so a few wedged cells
+# degrade instead of starving the cache.
+_GET_WORK_UNITS_BUDGET_SEC = 60.0
+
+
+def _fetch_work_units(exp):
+  """Materialize one experiment's work units (a single XM RPC + iteration).
+
+  A named module-level function rather than an inline lambda so it submits to
+  the pool as a plain no-arg-at-call callable via functools.partial -- the
+  default-arg-lambda idiom trips the pytype/pyrefly `submit` signature check.
+  """
+  return list(exp.get_work_units())
 
 
 def _read_log_tail(bucket: str, nbytes: int = 16384) -> str:
@@ -977,12 +1004,34 @@ def main(argv):
     sorted_active_ids = sorted(list(active_ids), key=lambda x: int(x) if x.isdigit() else x, reverse=True)
 
     console.print(f"Fetching {len(sorted_active_ids)} tracked experiments for user {args_user}...", style="dim")
+    # ONE batched list_experiments RPC instead of N per-id get_experiment calls.
+    # Each get_experiment issues its own get_analysis_context RPC, so N tracked
+    # ids cost N server round-trips; at ~280 ids that was minutes and blew past
+    # the 300s staleness alarm even after the per-call fan-out (the RPC TOTAL,
+    # not concurrency, was the wall). list_experiments(experiment_ids=[...])
+    # returns every matching Experiment from a SINGLE list_contexts call with the
+    # context proto (name, execution_details) already populated. Data may be up
+    # to ~1s stale per the API contract -- fine for a status board.
+    want_ids = [int(x) for x in sorted_active_ids if str(x).isdigit()]
     experiments = []
-    for xid in sorted_active_ids:
+    if want_ids:
         try:
-            experiments.append(c.get_experiment(int(xid)))
-        except Exception:
-            pass
+            fetched = {
+                e.id: e
+                for e in c.list_experiments(
+                    experiment_ids=want_ids, experiment_author=args_user
+                )
+            }
+        except Exception:  # noqa: BLE001 - a failed batch must degrade to an
+            # empty board row set, never abort; the next round retries.
+            fetched = {}
+        # Preserve the sorted_active_ids order (stable table); drop any id the
+        # batch did not return (same effect as a per-id fetch failure -- the
+        # row simply does not render this round).
+        for xid in want_ids:
+            exp = fetched.get(xid)
+            if exp is not None:
+                experiments.append(exp)
 
     # Start every log tail NOW, before the per-experiment loop, so the CNS round
     # trips overlap each other AND the XManager work-unit fetches below. Tailing
@@ -993,16 +1042,32 @@ def main(argv):
         [(tpu_jobs_map.get(str(exp.id), {}) or {}).get('bucket_cp_path', '')
          for exp in experiments])
 
+    # Prefetch every experiment's work units concurrently, before the render
+    # loop -- the same discipline as _fetch_log_tails above. Fetching inside the
+    # loop made the cost the SUM over jobs; here it is the slowest single fetch.
+    # The result dict maps exp.id -> (work_units_list, fetch_error_str) so the
+    # render loop stays byte-for-byte identical to the serial version, including
+    # the 'work units unreadable' vs 'No WorkUnits' distinction: a timed-out or
+    # failed fetch records its exception name exactly as the serial except did.
+    _wu_results = {}
+    _wu_futures = {
+        exp.id: _XM_POOL.submit(functools.partial(_fetch_work_units, exp))
+        for exp in experiments
+    }
+    _wu_deadline = time.monotonic() + _GET_WORK_UNITS_BUDGET_SEC
+    for exp in experiments:
+        try:
+            remaining = max(0.0, _wu_deadline - time.monotonic())
+            _wu_results[exp.id] = (_wu_futures[exp.id].result(timeout=remaining), '')
+        except Exception as exc:  # noqa: BLE001 - one bad/slow experiment must
+            # not abort the whole table; record the reason (not silently a
+            # 'config error') exactly as the serial fetch below used to.
+            _wu_futures[exp.id].cancel()
+            _wu_results[exp.id] = ([], type(exc).__name__)
+
     for exp in experiments:
         exp_id = exp.id
-        fetch_error = ''
-        try:
-            work_units = list(exp.get_work_units())
-        except Exception as exc:  # noqa: BLE001 - one bad experiment must not
-            # abort the whole table, but the reason must not be silently
-            # rewritten into 'config error' either.
-            work_units = []
-            fetch_error = type(exc).__name__
+        work_units, fetch_error = _wu_results.get(exp_id, ([], ''))
 
         name = exp.name if exp.name else str(exp_id)
         job_info = tpu_jobs_map.get(str(exp_id), {})

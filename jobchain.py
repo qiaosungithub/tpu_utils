@@ -108,6 +108,14 @@ UNKNOWN = '<UNKNOWN>'
 both 'genuinely full' and 'could not read', and a cell name doubling as its own metro made
 26 of 57 lookups silently wrong."""
 
+PERSONAL_ONLY_METROS = frozenset({'phx', 'ske'})
+"""Metros where the GROUP has no storage registration; mirrors
+`xm_launcher.py:_PERSONAL_ONLY_METROS`. A literal copy ON PURPOSE: importing the
+launcher would drag xmanager into every enqueue. Safe to duplicate because this
+is a REFUSAL list -- drifting by GAINING a metro only refuses more, and drifting
+by LOSING one is still caught by the launcher's identical gate downstream.
+Verify with: `grep -A4 _PERSONAL_ONLY_METROS ~/work/tpu_cmd/xm_launcher.py`"""
+
 
 # --- the chain -------------------------------------------------------------
 @dataclasses.dataclass
@@ -814,6 +822,33 @@ def validate_enqueue(job: Job, *, top_level_count: Optional[int] = None,
         f'arguments overwriting each other: the config, the checkpoint, or the entry-point '
         f'flag was lost, and the row reaches the launcher with nothing to execute. '
         f'Re-enqueue from the original definition rather than repairing this row.')
+
+  # --- personal-only metros are refused outright ---------------------------
+  # ★phx / ske are metros the GROUP has no storage registration in. They are
+  # the worst of the three metro outcomes, because they do not fail like the
+  # other two: a metro in neither of the launcher's dicts makes xm_launcher
+  # SystemExit into an inert zero-work-unit shell (visibly broken), while
+  # phx/ske RESOLVE, launch, bill, and write to the personal 500 GiB quota --
+  # ~468G used and its handle poisoned -- where the write fails with
+  # resource_exhausted AND LEAVES A 0-BYTE FILE. The loss looks like a file
+  # that exists and `tpu check` still says SUBMITTED.
+  # The launcher (xm_launcher.py `_local_bucket`) refuses these too; this is
+  # the second, earlier gate, so the refusal costs zero credits instead of
+  # arriving after an XID exists. Two gates on purpose: the launcher is the
+  # one nothing can bypass, this one is the one that gives a readable error
+  # at the moment the human typed the command.
+  if job.allowed_metros:
+    personal = sorted({m.strip().lower() for m in job.allowed_metros}
+                      & PERSONAL_ONLY_METROS)
+    if personal:
+      raise RejectedAtEnqueue(
+          f'{job.job_id}: metro(s) {personal} have NO group storage '
+          f'registration, so every write lands on the personal 500 GiB '
+          f'per-cell quota (~468G used, handle poisoned): the write fails '
+          f'with resource_exhausted and still leaves a 0-byte file, so the '
+          f'job looks like it produced output. Use a metro with group '
+          f'storage instead, or pass an explicit group-billed --bucket if '
+          f'you have chosen this location on purpose.')
 
   # --- bucket must be reachable from where the job will land ---------------
   # ★A bucket alone is not enough: it has to be in a metro the job can actually be placed

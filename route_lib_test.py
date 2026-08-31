@@ -197,7 +197,27 @@ class RerouteTest(unittest.TestCase):
     self.assertEqual(e.state, R.JobState.QUEUED)
     self.assertIsNone(e.xid)
     self.assertGreater(e.cooldown_cells['yulpptr'], 700.0)
-    self.assertEqual(e.attempts, 1)
+    # ★A re-route is NOT a build failure: `attempts` feeds the 3-strikes brake
+    # that parks a row HELD, so bumping it here parked healthy jobs that the
+    # router had merely moved between oversold cells (infra-v17, measured on
+    # elt's cars: attempts=3 with zero real build failures). Re-routes are
+    # counted separately, and the old XID is preserved for the audit.
+    self.assertEqual(e.attempts, 0)
+    self.assertEqual(e.reroutes, 1)
+    self.assertEqual(e.prior_xids, ['12345'])
+
+  def test_repeated_reroutes_never_trip_the_build_brake(self):
+    # Regression: an oversold-cell rotation must not park a healthy job.
+    e = _entry()
+    e.state = R.JobState.SUBMITTED
+    e.submitted_at = 0.0
+    for i in range(10):
+      e.cell = f'cell{i}'
+      e.xid = str(1000 + i)
+      R.mark_reroute(e, now=700.0 + i, cooldown_s=1800.0)
+    self.assertEqual(e.attempts, 0)
+    self.assertEqual(e.reroutes, 10)
+    self.assertEqual(len(e.prior_xids), 10)
 
   def test_reroute_then_replan_avoids_hot_cell(self):
     # end-to-end: job stuck in yulpptr, re-routed, next plan picks another cell.

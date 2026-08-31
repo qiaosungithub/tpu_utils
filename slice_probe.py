@@ -42,6 +42,19 @@ _PLATFORM = {
     'v7': 'GHOSTFISHLITE',
     'v6e': 'GHOSTLITE_POD',
     'v6p': 'GHOSTFISH',
+    # NVIDIA GPUs. The probe reads the platform enum by name off
+    # ScalarResource.Key, so any card the enum knows works; these are the
+    # families we might schedule. Note the topology form differs from TPUs:
+    # GPUs use 'chips_per_host x num_hosts' NVLink shapes, e.g. --topology=8
+    # for a single 8-GPU HGX node, or --topology=4x2 for GB200 (4 chips/host).
+    'a100': 'GPU_TESLA_A100_40GIB',
+    'a100_80gib': 'GPU_TESLA_A100_80GIB',
+    'h100': 'GPU_NVIDIA_H100',
+    'h200': 'GPU_NVIDIA_H200',
+    'b200': 'GPU_NVIDIA_B200',
+    'b300': 'GPU_NVIDIA_B300',
+    'gb200': 'GPU_NVIDIA_GB200',
+    'gb300': 'GPU_NVIDIA_GB300',
 }
 
 _GROUP = flags.DEFINE_string('group', '9', 'Group number or a full alloc string.')

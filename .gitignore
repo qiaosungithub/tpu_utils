@@ -3,3 +3,15 @@ __pycache__/
 *.pyc
 # Blaze convenience symlinks, if any ever land here.
 blaze-*
+
+# Point-in-time source backups taken before a risky edit (infra-v12..v18).
+# They are snapshots, not history -- git is the history. Keeping them out of
+# the index stops each generation from re-adding another 20 near-identical
+# copies of route_check.py. Delete them once the change they guard is committed.
+*.bak_*
+*.bak.*
+*.orig
+# Rendered/templated inputs and runtime state: regenerated, or per-machine.
+*.in
+*.log
+*.json

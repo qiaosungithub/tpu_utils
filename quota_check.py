@@ -57,6 +57,27 @@ TPU_DISPLAY_NAMES = {
     "tpu_zebrafish": "TPU Zebrafish",
 }
 
+# NVIDIA GPU quota fields, from the SAME ResourceSet proto
+# (learning/deepmind/xmanager2/resources/proto/resource_model.proto). The
+# checker keys on the proto FIELD name (gpu_*), not the ScalarResource enum, and
+# these are chip (device) counts just like the TPU rows. Only the families we
+# might actually schedule are named; the rest fall through to their raw field
+# name so a new card still shows up rather than vanishing.
+GPU_DISPLAY_NAMES = {
+    "gpu_a100": "GPU A100-40G",
+    "gpu_a100_80gib": "GPU A100-80G",
+    "gpu_h100": "GPU H100",
+    "gpu_h200": "GPU H200",
+    "gpu_b200": "GPU B200",
+    "gpu_b300": "GPU B300",
+    "gpu_gb200": "GPU GB200",
+    "gpu_gb300": "GPU GB300",
+    "gpu_v100": "GPU V100",
+    "gpu_p100": "GPU P100",
+    "gpu_t4": "GPU T4",
+    "gpu_l4_24th": "GPU L4 (1/24)",
+}
+
 # Legacy accelerators we never schedule on; hidden to keep the table short.
 EXCLUDED_TPU_KEYS = {
     "tpu_jellyfish",
@@ -88,7 +109,26 @@ def _tier_has_signal(type_dict):
   )
 
 
+WITHDRAWN_RESOURCES = frozenset({"gpu_gb200", "gpu_gb300"})
+"""Families this group may not use (operator directive, 2026-08-28).
+
+Hidden from the quota and money boards so nobody plans around capacity they cannot
+have. ★Hiding is NOT the enforcement: the refusal lives at the enqueue gate
+(jobchain.FORBIDDEN_ARCHS), because a board is a view and a view cannot stop a
+submission. Note also what is deliberately NOT done -- the `gb200) echo "20"` row in
+tpu_wrapper.sh stays, since it is a limit-PRICE cap and its caller reads an absent cap
+as "no policy, leave the job uncapped": deleting it would RELAX the constraint while
+looking like a removal.
+"""
+
+
+def is_withdrawn(tpu_type):
+  return str(tpu_type).lower() in WITHDRAWN_RESOURCES
+
+
 def map_tpu_types(tpu_type):
+  if tpu_type in GPU_DISPLAY_NAMES:
+    return GPU_DISPLAY_NAMES[tpu_type]
   return TPU_DISPLAY_NAMES.get(tpu_type, tpu_type)
 
 
@@ -101,8 +141,12 @@ def get_tpu_map(res_set):
   tpus = {}
   if not res_set:
     return tpus
+  # Both accelerator families live in the same ResourceSet proto: TPUs under
+  # tpu_* fields, NVIDIA GPUs under gpu_* fields. Count both -- a GPU floor is
+  # a real quota row exactly like a TPU one, and the display-name map keys on
+  # the proto field name for either.
   for field in res_set.DESCRIPTOR.fields:
-    if not field.name.startswith("tpu_"):
+    if not (field.name.startswith("tpu_") or field.name.startswith("gpu_")):
       continue
     val = getattr(res_set, field.name)
     if val:
@@ -148,6 +192,8 @@ def generate_table(title, agg_dict, obtainable_is_max=False):
     tier_printed = False
 
     for friendly_tpu, stats in sorted(type_dict.items()):
+      if is_withdrawn(friendly_tpu):
+        continue          # withdrawn family: see WITHDRAWN_RESOURCES
       quota = stats["quota"]
       used = stats["used"]
       obtainable = stats["obtainable"]
@@ -270,6 +316,8 @@ def _build_global_agg(group_aggs):
       tpu_names.update(agg[tier].keys())
 
     for name in tpu_names:
+      if is_withdrawn(name):
+        continue          # withdrawn family: see WITHDRAWN_RESOURCES
       per_group = {
           idx: agg[tier].get(name) for idx, agg in group_aggs.items()
       }

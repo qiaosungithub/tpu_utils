@@ -310,7 +310,26 @@ class QueueEntry:
   submitted_at: Optional[float] = None   # epoch when handed to XM
   build_started_at: Optional[float] = None  # epoch a worker claimed it (BUILDING)
   worker_id: Optional[str] = None   # which worker claimed it (BUILDING); for debug
-  attempts: int = 0                 # placement attempts so far
+  attempts: int = 0                 # BUILD failures so far -- the 3-strikes
+                                    # brake reads THIS. Never bump it for a
+                                    # re-route: a re-route is the router moving
+                                    # a healthy job to another cell, not the job
+                                    # failing to build (infra-v17).
+  reroutes: int = 0                 # how many times the router moved this job
+  # ★Which alloc group the ROUTER admitted this job under (operator 00:05Z:
+  # "我反复要求过优先用 G5 / G3"). The dispatch and build stages are separate
+  # processes, so the group chosen while checking budget must be carried ON THE
+  # ROW -- otherwise the builder falls back to its global --group (9) and every
+  # car lands on the one pool that has a hard 1/10-of-income ceiling, while g5/g3
+  # sit idle. None = not yet decided; the builder then uses its own default.
+  group: Optional[str] = None
+  # ★EVERY XID THIS ROW HAS EVER HELD, oldest first, excluding the current one.
+  # `xid` is overwritten on each placement, so without this a resubmitted row
+  # leaves its earlier experiment with NO local record anywhere -- which reads
+  # exactly like an orphan to any XM->local audit, and is unfindable when you
+  # need to stop it. A row with attempts>0 and an empty prior_xids is itself a
+  # signal: the history predates this field.
+  prior_xids: list[str] = dataclasses.field(default_factory=list)
   cooldown_cells: dict = dataclasses.field(default_factory=dict)  # cell -> until-epoch
   last_reason: str = ''             # why it is where it is (for status view)
 
@@ -566,8 +585,17 @@ def apply_placement(entry: QueueEntry, placement: Placement, xid: str,
   shape/cell/xid and the submit clock started. For a topology-locked job placed
   for the FIRST time, freeze `locked_geometry` from the chosen shape so every
   later re-route stays on the same mesh. The binary calls this right after
-  `tpu queue` returns an XID."""
+  `tpu queue` returns an XID.
+
+  ★The previous XID is PRESERVED in `prior_xids`, never just overwritten: a row
+  that is resubmitted (build retry, re-route) would otherwise erase the only
+  local trace of an experiment that may still be running and billing."""
   entry.state = JobState.SUBMITTED
+  if entry.xid and entry.xid != xid:
+    if not entry.prior_xids:
+      entry.prior_xids = []
+    if entry.xid not in entry.prior_xids:
+      entry.prior_xids.append(entry.xid)
   entry.xid = xid
   entry.cell = placement.cell
   entry.arch = placement.arch
@@ -650,6 +678,16 @@ def mark_reroute(entry: QueueEntry, now: float, cooldown_s: float) -> QueueEntry
   it was stuck in put on cooldown so the next plan avoids it for a while."""
   if entry.cell:
     entry.cooldown_cells[entry.cell] = now + cooldown_s
+  # ★Preserve the XID before clearing it (infra-v17). A re-routed row gets
+  # xid=None, and without this the cancelled experiment becomes invisible to
+  # every audit that enumerates known XIDs (xid_recon/recon.py reads
+  # prior_xids explicitly) -- i.e. a ghost car. record_submit already does
+  # this on the re-submit path; the reroute path was missing it.
+  if entry.xid:
+    if not entry.prior_xids:
+      entry.prior_xids = []
+    if entry.xid not in entry.prior_xids:
+      entry.prior_xids.append(entry.xid)
   entry.state = JobState.QUEUED
   entry.last_reason = (f"re-routed after pending in {entry.cell} "
                        f">{int((now - (entry.submitted_at or now)))}s")
@@ -658,7 +696,12 @@ def mark_reroute(entry: QueueEntry, now: float, cooldown_s: float) -> QueueEntry
   entry.arch = None
   entry.chips = None
   entry.submitted_at = None
-  entry.attempts += 1
+  # ★NOT attempts: that counter feeds the 3-strikes build brake (route_check
+  # parks a row HELD at max_build_attempts). A re-route is not a build failure
+  # -- counting it there let an oversold-cell rotation park elt's cars with
+  # zero real build failures (measured 22:1xZ: v3e had attempts=3, all from
+  # re-routes). Track re-routes separately.
+  entry.reroutes += 1
   return entry
 
 
@@ -846,7 +889,9 @@ def decide_reconcile(local_state: 'JobState', xm_status: str,
                      terminal_const: str = 'TERMINAL',
                      running_const: str = 'RUNNING',
                      pending_const: str = 'PENDING',
-                     unknown_const: str = 'UNKNOWN') -> Optional['JobState']:
+                     unknown_const: str = 'UNKNOWN',
+                     completed_const: str = 'COMPLETED'
+                     ) -> Optional['JobState']:
   """Pure reconcile decision for ONE entry, given its local state and XM's live
   status. Returns the NEW JobState to write, or None for 'leave unchanged'.
 
@@ -854,6 +899,7 @@ def decide_reconcile(local_state: 'JobState', xm_status: str,
   UNKNOWN (probe failed) -> None: we do not mark a job dead because a probe
   hiccuped. Only a definite XM verdict moves an entry.
 
+    XM COMPLETED -> DONE       (it RAN TO COMPLETION -- a success, not a zombie)
     XM TERMINAL  -> FAILED     (zombie cleanup: XM dropped it / it failed/stopped)
     XM RUNNING   & local SUBMITTED -> RUNNING  (placement took; promote)
     XM RUNNING   & local RUNNING   -> None      (already correct)
@@ -861,7 +907,16 @@ def decide_reconcile(local_state: 'JobState', xm_status: str,
                                 step -- not reconcile -- owns pending>deadline)
     XM UNKNOWN   -> None       (never act blind)
   A local entry not in RECONCILABLE_STATES is never passed here (caller filters).
+
+  COMPLETED vs TERMINAL: these were a single status until it was measured that
+  105 of 227 queue rows had been reconciled to FAILED, 100% of them, including
+  jobs whose results were already in use. A finished job is DONE. Only the probe
+  can tell the two apart, so this function is only as correct as the status it
+  is handed -- an unrecognised status still falls through to no-op, and UNKNOWN
+  is still never actioned.
   """
+  if xm_status == completed_const:
+    return JobState.DONE
   if xm_status == terminal_const:
     return JobState.FAILED
   if xm_status == running_const and local_state == JobState.SUBMITTED:
@@ -881,7 +936,9 @@ def reconcile_entry(entry: QueueEntry, xm_status: str, reason: str = '') -> bool
     return False
   old = entry.state
   entry.state = new_state
-  if new_state == JobState.FAILED:
+  if new_state == JobState.DONE:
+    entry.last_reason = reason or f'reconciled: XM reports COMPLETED (was local {old.value}); finished normally'
+  elif new_state == JobState.FAILED:
     entry.last_reason = reason or f'reconciled: XM reports terminal (was local {old.value}); zombie cleaned up'
   elif new_state == JobState.RUNNING:
     entry.last_reason = reason or f'reconciled: XM confirms RUNNING (was local {old.value})'

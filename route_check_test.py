@@ -3,6 +3,8 @@ shell, no real queue file except a temp round-trip."""
 
 import os
 import tempfile
+import json
+import subprocess
 import unittest
 
 from google3.experimental.users.qiaos.tpu_utils import avail_provider as AP
@@ -326,6 +328,10 @@ class _BudgetRefusedSubmitter:
     return None, ('[budget check] total projected: 9999 (Limit: 2228)\n'
                   '[[BUDGET_DEFERRED]]\n'
                   '[budget check] ERROR: Budget exceeded for tpu check!')
+
+  def cancel(self, xid):
+    """Part of the _Submitter protocol; never exercised by these tests."""
+    raise AssertionError(f'cancel({xid}) must not be called in this test')
 
 
 def _submitted(job_id, xid, cell, submitted_at, **kw):
@@ -786,7 +792,7 @@ class IsBudgetDeferralTest(unittest.TestCase):
   def test_absent(self):
     self.assertFalse(RC.is_budget_deferral('Launched experiment 123'))
     self.assertFalse(RC.is_budget_deferral(''))
-    self.assertFalse(RC.is_budget_deferral(None))
+    self.assertFalse(RC.is_budget_deferral(''))  # None-ish input, typed as str
 
   def test_substring_not_matched(self):
     # must be its OWN line, not embedded in prose (avoid false positives).
@@ -1022,6 +1028,136 @@ class RunReconcileTest(unittest.TestCase):
     self.assertIn('1 promoted->RUNNING', summary[0])
     self.assertIn('1 UNKNOWN', summary[0])
 
+
+
+# --- submit timeout: local failure is not remote absence -------------------
+# ★The bug this covers cost real money: `tpu queue` timed out at 1800s, the
+# submitter reported "no XID", the worker counted a failed attempt and
+# RESUBMITTED -- while the first experiment was already running. Two copies
+# billed the same quota, and the orphan had no local row at all.
+_PARTIAL_WITH_XID = 'Launched experiment 284946261\nstill building...'
+
+
+class _FakeTimeout(subprocess.TimeoutExpired):
+  def __init__(self, stdout=b'', stderr=b''):
+    super().__init__(cmd='tpu queue', timeout=1800.0)
+    self.stdout = stdout
+    self.stderr = stderr
+
+
+class SubmitTimeoutRecoveryTest(unittest.TestCase):
+
+  def _submitter(self, name_lookup=None):
+    s = RC.Submitter()
+    if name_lookup is not None:
+      s.find_xid_by_name = name_lookup
+    return s
+
+  def test_xid_recovered_from_partial_output(self):
+    """Cheapest probe: the id was already printed before the timeout."""
+    s = self._submitter(lambda n, **kw: (None, 'should not be reached'))
+    xid, out = s._recover_timed_out_xid(
+        _FakeTimeout(stdout=_PARTIAL_WITH_XID.encode()),
+        ['tpu', 'queue', '--exp_name=job_a'])
+    self.assertEqual(xid, '284946261')
+    self.assertIn('WAS created', out)
+
+  def test_xid_recovered_from_xm_by_name(self):
+    """Timeout landed before the id flushed -> ask XManager by name."""
+    s = self._submitter(lambda n, **kw: ('284999999', 'XM lookup matched 1'))
+    xid, out = s._recover_timed_out_xid(
+        _FakeTimeout(), ['tpu', 'queue', '--exp_name=job_a'])
+    self.assertEqual(xid, '284999999')
+    self.assertIn('Adopting it', out)
+
+  def test_NC_genuinely_absent_still_reports_no_xid(self):
+    """★Negative control: when the job really was not submitted, we must still
+    say so -- the fix must not fabricate an XID and strand a QUEUED row."""
+    s = self._submitter(lambda n, **kw: (None, 'XM lookup ran and found no exact-name match'))
+    xid, out = s._recover_timed_out_xid(
+        _FakeTimeout(), ['tpu', 'queue', '--exp_name=job_a'])
+    self.assertIsNone(xid)
+    self.assertIn('Treating as not-submitted', out)
+
+  def test_NC_unknown_remote_state_is_named_not_guessed(self):
+    """No --exp_name -> we cannot check; say UNKNOWN rather than imply failure."""
+    s = self._submitter()
+    xid, out = s._recover_timed_out_xid(_FakeTimeout(), ['tpu', 'queue'])
+    self.assertIsNone(xid)
+    self.assertIn('UNKNOWN', out)
+
+  def test_NC_xm_lookup_failure_does_not_claim_absence(self):
+    """If the lookup itself failed, that is not evidence the job is absent."""
+    s = self._submitter(lambda n, **kw: (None, 'XM lookup itself timed out; remote state UNKNOWN'))
+    xid, out = s._recover_timed_out_xid(
+        _FakeTimeout(), ['tpu', 'queue', '--exp_name=job_a'])
+    self.assertIsNone(xid)
+    self.assertIn('UNKNOWN', out)
+
+
+  def test_submit_ITSELF_recovers_on_timeout(self):
+    """★End-to-end through submit(), with a REAL timeout -- no monkeypatching.
+
+    NEGATIVE-CONTROL GAP THIS CLOSES: testing `_recover_timed_out_xid` alone
+    still passed when the recovery was ripped out of `submit()`, because
+    nothing asserted that submit() actually CALLS it. Here the wrapper is a
+    throwaway script that prints the XID and then hangs past the deadline --
+    exactly the real shape (experiment created early, build still running).
+    """
+    d = tempfile.mkdtemp()
+    wrapper = os.path.join(d, 'fake_wrapper.sh')
+    with open(wrapper, 'w') as f:
+      f.write('tpu() { echo "Launched experiment 284946261"; sleep 30; }\n')
+    self.addCleanup(lambda: os.path.exists(wrapper) and os.remove(wrapper))
+
+    s = RC.Submitter(wrapper_path=wrapper, timeout_s=1.0)
+    xid, out = s.submit(['tpu', 'queue', '--exp_name=job_a'])
+    self.assertEqual(xid, '284946261',
+                     'submit() must adopt the already-created experiment')
+    self.assertIn('WAS created', out)
+
+  def test_exp_name_parsing(self):
+    self.assertEqual(RC._exp_name_of(['tpu', '--exp_name=abc']), 'abc')
+    self.assertIsNone(RC._exp_name_of(['tpu', 'queue']))
+
+
+class PriorXidsTest(unittest.TestCase):
+  """A resubmitted row must keep its earlier XIDs findable."""
+
+  def _entry(self):
+    return R.QueueEntry(job_id='j1', power='h100-8', allowed_archs=['h100'])
+
+  def _placement(self):
+    return R.Placement(job_id='j1', cell='sh', arch='h100', chips=8,
+                       price=4.0, reason='test', geometry=None)
+
+  def test_superseded_xid_is_preserved(self):
+    e = self._entry()
+    R.apply_placement(e, self._placement(), xid='111', now=0.0)
+    self.assertEqual(e.prior_xids, [])
+    R.apply_placement(e, self._placement(), xid='222', now=1.0)
+    self.assertEqual(e.xid, '222')
+    self.assertEqual(e.prior_xids, ['111'], 'the first XID must remain findable')
+
+  def test_resubmitting_same_xid_is_not_recorded_twice(self):
+    e = self._entry()
+    R.apply_placement(e, self._placement(), xid='111', now=0.0)
+    R.apply_placement(e, self._placement(), xid='111', now=1.0)
+    self.assertEqual(e.prior_xids, [])
+
+  def test_history_survives_a_round_trip_through_json(self):
+    e = self._entry()
+    R.apply_placement(e, self._placement(), xid='111', now=0.0)
+    R.apply_placement(e, self._placement(), xid='222', now=1.0)
+    back = R.QueueEntry.from_dict(json.loads(json.dumps(e.to_dict())))
+    self.assertEqual(back.prior_xids, ['111'])
+
+  def test_old_rows_without_the_field_still_load(self):
+    """Backward compatibility: a queue written before this field must load."""
+    d = self._entry().to_dict()
+    d.pop('prior_xids', None)
+    back = R.QueueEntry.from_dict(d)
+    self.assertEqual(back.prior_xids, [])
 
 if __name__ == '__main__':
   unittest.main()

@@ -82,8 +82,19 @@ def _headroom() -> float | None:
   script = os.path.expanduser('~/work/wiki_agents/tools/budget_check.py')
   if not os.path.isfile(script):
     return None
+  # ★NOT sys.executable: inside a PAR that is the PAR ITSELF, not an
+  # interpreter, so this line re-invoked jobd with budget_check.py as a
+  # positional arg. absl then parsed --query against JOBD's flag set, failed
+  # with "Unknown command line flag 'query'", and exited 1 before main() --
+  # every single time. _headroom saw no '{' line and returned None, so the
+  # budget gate was permanently blind while looking permanently safe.
+  # ★The tell for this whole family: an absl flag error naming a flag that
+  # belongs to the HELPER, not to the caller.
+  interp = '/usr/bin/python3'
+  if not os.path.isfile(interp):
+    return None                      # fail closed; never a plausible default
   try:
-    p = subprocess.run([sys.executable, script, '--query', 'v6p-32', 'PROD'],
+    p = subprocess.run([interp, script, '--query', 'v6p-32', 'PROD'],
                        capture_output=True, text=True, timeout=90)
     for line in (p.stdout or '').splitlines():
       line = line.strip()

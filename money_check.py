@@ -1,3 +1,4 @@
+from google3.experimental.users.qiaos.tpu_utils import cap_policy
 from google3.experimental.users.qiaos.tpu_utils import group_utils
 from google3.experimental.users.qiaos.tpu_utils.preflight import market
 from google3.learning.deepmind.xmanager2.client import resource_service
@@ -27,6 +28,20 @@ TARGET_CARDS = [
     ("TPU v6e", "tpu_ghostlite_pod", [76, 63]),
     ("TPU v6p", "tpu_ghostfish", [92]),
     ("TPU v7", "tpu_ghostfishlite", [101]),
+    # NVIDIA GPUs. Same dynamic pools, same Spanner ResourcePrices table (the
+    # fetch is not TPU-filtered), so the price data already flows -- these rows
+    # only make it visible. Card codes are the ResourceType ids from
+    # //depot/google3/third_party/py/xmanager/xm/resources.py: A100=46/80G=66,
+    # H100=70, H200=86, B200=87, B300=112, GB200=89, GB300=100.
+    ("GPU A100", "gpu_tesla_a100", [46, 66]),
+    ("GPU H100", "gpu_nvidia_h100", [70]),
+    ("GPU H200", "gpu_nvidia_h200", [86]),
+    ("GPU B200", "gpu_nvidia_b200", [87, 112]),
+    # GB200 (89) / GB300 (100) are deliberately ABSENT: the operator's directive is
+    # that this group does not use them, and a family nobody may request has no
+    # business occupying a row on the money board. The refusal itself lives at the
+    # enqueue gate (jobchain.FORBIDDEN_ARCHS), not here -- dropping a row only hides
+    # the family, it cannot stop a submission.
 ]
 
 class _BalanceByMdbQuery(pyspanner.Query):
@@ -113,12 +128,29 @@ def fetch_limit_orders(gqm_tool, pools_out=None):
     return orders
 
 
+# Sentinel "user" for a cap that comes from OUR policy rather than a row in the
+# server's LimitOrders table. _limit_order_cell renders it as "(policy)".
+_POLICY_USER = "\x00policy"
+
+
 def _resolve_cap(limit_orders, my_mdbs, type_ids, tier):
     """Returns (cap_credits, user) for this (card, tier), or (None, None).
 
     Shared by the limit-order column and the per-cell colouring so the two can
     never disagree about which cells are actually reachable.
+
+    OUR policy wins. We cap every PROD job we launch (and every existing one) at
+    a fixed per-family price from cap_policy.CAP_POLICY, per-XID -- so that,
+    not a teammate's MDB-wide group cap, is the price our jobs actually face.
+    Show and colour against it. BATCH is never capped by us (it clears at ~0 and
+    its admission never reads a price), so for BATCH we fall through to whatever
+    the server carries.
     """
+    if str(tier).upper() == "PROD":
+        for type_id in type_ids:
+            our = cap_policy.cap_for_type_id(type_id)
+            if our is not None:
+                return float(our), _POLICY_USER
     for mdb in sorted(my_mdbs):
         for type_id in type_ids:
             found = limit_orders.get((mdb, type_id, tier))
@@ -165,9 +197,15 @@ def _limit_order_cell(limit_orders, my_mdbs, type_ids, tier, price_min, price_ma
     # once under the table, and `dynlo`/Spanner have the per-row detail.
     # An entry set by YOU is worth calling out inline, since that is the one
     # you can change directly.
-    owner = " [dim](yours)[/dim]" if user and user == _me() else ""
-    if user and user != _me():
-        _OTHERS_CAPS.add(user)
+    if user == _POLICY_USER:
+        # Our own fixed policy cap (cap_policy.CAP_POLICY), applied per-XID to
+        # every PROD job we launch -- not a row someone typed into the shared
+        # LimitOrders table. This is the price our jobs actually face.
+        owner = " [dim](policy)[/dim]"
+    else:
+        owner = " [dim](yours)[/dim]" if user and user == _me() else ""
+        if user and user != _me():
+            _OTHERS_CAPS.add(user)
     if price_min is not None and price_min > cap:
         # Every cell we can see is above the cap: nothing can clear.
         return f"[bold red]{cap:.2f} BLOCKS ALL[/bold red]{owner}"
@@ -496,7 +534,24 @@ def main(argv):
                 # every cell is unobtainable right now" -- both used to render
                 # as a bare N/A, which hid a real signal.
                 if not entries:
-                    note = "[dim]not offered in this pool[/dim]"
+                    # ★Say WHICH tier lacks it, and whether the OTHER tier has it.
+                    # "not offered in this pool" reads as "this card is unavailable to us",
+                    # and for H200 that was wrong in a way only a cross-table comparison
+                    # revealed: PROD has no price at all while BATCH quotes three cells and
+                    # quota shows 52 obtainable. Same trap this branch was already built to
+                    # avoid -- it split "never offered" from "all cells unobtainable", but
+                    # left "not offered in THIS tier" looking like "not offered anywhere".
+                    other_tier = 'BATCH' if tier_label == 'PROD' else 'PROD'
+                    other = []
+                    for type_id in type_ids:
+                        other.extend(spanner_prices.get((type_id, other_tier), []))
+                    other_valid = [e for e in other if e[1] is not None]
+                    if other_valid:
+                        note = (f"[dim]not offered in {tier_label}[/dim] "
+                                f"[yellow](but {other_tier} has "
+                                f"{len(other_valid)})[/yellow]")
+                    else:
+                        note = f"[dim]not offered in {tier_label} or {other_tier}[/dim]"
                 else:
                     note = (f"[yellow]unobtainable in all "
                             f"{len(entries)} cells[/yellow]")

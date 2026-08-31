@@ -134,7 +134,13 @@ def _extract_cells(resp, tier: str, platform_key_enum: int) -> list[CellCapacity
   """
   want_tier_enum = _TIER_ENUM.get(tier.upper())
   cells: dict[str, CellCapacity] = {}
-
+  # Live opportunistic ceiling per cell, read from the pool-level
+  # `max_available_chips` (DynamicPoolAvailability field 2 / StaticPool field 3).
+  # This is the market-level free-chip count (within-floor + acquirable), which
+  # for a free-pool arch like GB200 is far larger than the per-allotment
+  # `obtainable_capacity` forecast -- folding it in stops a healthy free pool
+  # from being flagged RED purely because the allotment's obtainable is low.
+  free_by_cell: dict[str, int] = {}
   def _walk_tiered(tiered_list):
     for tier_bucket in tiered_list:
       if tier_bucket.tier != want_tier_enum:
@@ -160,10 +166,31 @@ def _extract_cells(resp, tier: str, platform_key_enum: int) -> list[CellCapacity
                   prev,
                   within_floor=prev.within_floor + chips,
                   obtainable=prev.obtainable + chips)
+      # Pool-level max_available_chips: same CellAvailability shape, but hangs
+      # directly off `availability` (not per-allotment). Sum matching-platform
+      # chips per cell into free_by_cell.
+      for cell_av in (getattr(av, 'max_available_chips', None) or []):
+        cell = cell_av.cell
+        for ptcc in cell_av.platform_to_chip_counts:
+          if ptcc.platform != platform_key_enum:
+            continue
+          free_by_cell[cell] = free_by_cell.get(cell, 0) + int(ptcc.num_chips)
 
   _walk_tiered(resp.tiered_dynamic_pool_availabilities)
   _walk_tiered(resp.tiered_static_pool_availabilities)
 
+  # Fold the live free-chip ceiling into each cell's max_available. A cell that
+  # only shows up in max_available_chips (no allotment obtainable) still becomes
+  # a candidate; a cell present in both takes the larger of the two.
+  for cell, free in free_by_cell.items():
+    prev = cells.get(cell)
+    if prev is None:
+      cells[cell] = CellCapacity(
+          cell=cell, tier=tier, within_floor=0,
+          max_available=free, obtainable=0)
+    else:
+      cells[cell] = dataclasses.replace(
+          prev, max_available=max(prev.max_available, free))
   return list(cells.values())
 
 
@@ -218,12 +245,19 @@ def check_capacity(alloc: str, tier: str, xm_accelerator_key: str,
     # It is a fallback rather than the primary source because it costs a much
     # slower RPC (~25 s vs ~1 s) and is a forecast rather than a live figure.
     cells = _fetch_forecast_cells(alloc, tier, xm_accelerator_key)
-  cells_ok = tuple(sorted([c for c in cells if c.obtainable >= chips_required],
-                          key=lambda c: -c.obtainable))
-  cells_insufficient = tuple(sorted([c for c in cells if 0 < c.obtainable < chips_required],
-                                    key=lambda c: -c.obtainable))
+  # Effective placeable chips per cell = max of the allotment obtainable-capacity
+  # forecast and the live pool-level free ceiling (max_available). A free-pool
+  # arch (e.g. GB200) can have a tiny allotment obtainable but a large live free
+  # pool; using only obtainable would flag it RED even though a job would place.
+  def _eff(c: CellCapacity) -> int:
+    return max(c.obtainable, c.max_available)
+
+  cells_ok = tuple(sorted([c for c in cells if _eff(c) >= chips_required],
+                          key=lambda c: -_eff(c)))
+  cells_insufficient = tuple(sorted([c for c in cells if 0 < _eff(c) < chips_required],
+                                    key=lambda c: -_eff(c)))
   total_cap = sum(c.within_floor for c in cells)
-  total_obt = sum(c.obtainable for c in cells)
+  total_obt = sum(_eff(c) for c in cells)
 
   # Alloc-scoped quota (via floor_v2): what the user sees in tpu quota.
   # This is stricter than the pool-wide obtainable_capacity from GoodputService.
@@ -233,11 +267,12 @@ def check_capacity(alloc: str, tier: str, xm_accelerator_key: str,
   warnings = []
   if not cells_ok:
     hard_error = (
-        f"No cell in {alloc} at {tier} has {chips_required} obtainable "
-        f"{xm_accelerator_key} chips. Total obtainable across "
+        f"No cell in {alloc} at {tier} has {chips_required} available "
+        f"(max of obtainable-forecast and live-free) "
+        f"{xm_accelerator_key} chips. Total available across "
         f"{len(cells)} cells: {total_obt}.")
     if cells_insufficient:
-      top_hint = ', '.join(f'{c.cell}:{c.obtainable}' for c in cells_insufficient[:5])
+      top_hint = ', '.join(f'{c.cell}:{_eff(c)}' for c in cells_insufficient[:5])
       hard_error += f" Top cells (chips available): {top_hint}."
     return CapacityResult(
         ok=False, cells_ok=(), cells_insufficient=cells_insufficient,

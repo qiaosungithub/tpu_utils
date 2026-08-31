@@ -3,7 +3,11 @@ so the pure helpers and the fetch glue are covered without google3 at runtime.""
 
 import json
 import os
+import sys
 import tempfile
+import importlib
+import types
+import typing
 import unittest
 
 from google3.experimental.users.qiaos.tpu_utils import avail_provider as AP
@@ -73,8 +77,13 @@ class MetroTest(unittest.TestCase):
     self.assertEqual(AP.metro_of('sk'), 'sin')
     self.assertEqual(AP.metro_of('je'), 'cbf')
 
-  def test_unknown_falls_back_to_self(self):
-    self.assertEqual(AP.metro_of('zz'), 'zz')
+  def test_unknown_cell_fails_CLOSED_and_never_guesses(self):
+    # Was `assertEqual(metro_of('zz'), 'zz')` -- the old guess-your-own-name
+    # fallback, which made `--metro` silently drop valid cells (an unknown cell
+    # read as "no capacity"). metro_of now yields the UNKNOWN sentinel, and
+    # callers tell the two cases apart with `is UNKNOWN`.
+    self.assertIs(AP.metro_of('zz'), AP.metro_util.UNKNOWN)
+    self.assertNotEqual(AP.metro_of('zz'), 'zz')
 
 
 class LoadPricesTest(unittest.TestCase):
@@ -233,6 +242,219 @@ class FetchTest(unittest.TestCase):
     self.assertEqual(pool['v7'], 3911 + 545)
     self.assertEqual(pool['v6p'], 200)
     self.assertEqual(sorted(calls), [92, 101])
+
+
+# --- half-initialised module recovery --------------------------------------
+# The bug: one transient gRPC failure inside a lazy import leaves a populated-
+# but-empty module in sys.modules, and Python never re-imports it, so a
+# long-lived worker is pinned forever while LOOKING like it is queueing.
+# Negative controls matter more than the positive case here: evicting on the
+# WRONG exception would mask a genuine missing dependency.
+
+def _install_real_module(testcase, name, body='VALUE = 1\n'):
+  """Write a REAL module to a temp dir on sys.path and import it.
+
+  importlib.reload() re-runs find_spec, so a module that exists only as an
+  in-memory object cannot be reloaded -- the fix must be exercised against a
+  module that is genuinely importable, as the RPC stack is.
+  """
+  d = tempfile.mkdtemp()
+  with open(os.path.join(d, name + '.py'), 'w') as f:
+    f.write(body)
+  sys.path.insert(0, d)
+  testcase.addCleanup(lambda: sys.path.remove(d) if d in sys.path else None)
+  testcase.addCleanup(sys.modules.pop, name, None)
+  return importlib.import_module(name)
+
+
+_POISON_MSG = (
+    "module 'google3.net.rpc.python.contrib.base_stubby_api' has no "
+    "attribute 'BaseStubbyApi'")
+
+
+class HalfInitDiscriminatorTest(unittest.TestCase):
+  """`_looks_half_initialised`: AttributeError yes, everything else no."""
+
+  def test_attribute_error_on_module_is_half_initialised(self):
+    self.assertTrue(AP._looks_half_initialised(AttributeError(_POISON_MSG)))
+
+  def test_import_error_is_NOT_half_initialised(self):
+    # ImportError means genuinely absent. Evicting + retrying cannot help and
+    # would hide the real error behind a second RPC deadline.
+    self.assertFalse(
+        AP._looks_half_initialised(ImportError('gRPC is not installed')))
+    self.assertFalse(
+        AP._looks_half_initialised(ModuleNotFoundError('No module named x')))
+
+  def test_unrelated_attribute_error_is_NOT_half_initialised(self):
+    # A plain attribute typo on an object must not trigger eviction.
+    self.assertFalse(
+        AP._looks_half_initialised(
+            AttributeError("'NoneType' object has no attribute 'foo'")))
+
+  def test_rpc_error_is_NOT_half_initialised(self):
+    # An ordinary RPC failure (deadline, unavailable) is the COMMON case and
+    # must fall through to the caller untouched.
+    self.assertFalse(AP._looks_half_initialised(RuntimeError('deadline exceeded')))
+
+  def test_poisoned_module_name_is_parsed(self):
+    self.assertEqual(
+        AP._poisoned_module_name(AttributeError(_POISON_MSG)),
+        'google3.net.rpc.python.contrib.base_stubby_api')
+    self.assertIsNone(AP._poisoned_module_name(AttributeError('nope')))
+
+
+class ReloadScopeTest(unittest.TestCase):
+  """What `_reload_candidates` takes, and -- more important -- what it spares."""
+
+  def setUp(self):
+    super().setUp()
+    self._saved = dict(sys.modules)
+    self.addCleanup(self._restore)
+
+  def _restore(self):
+    sys.modules.clear()
+    sys.modules.update(self._saved)
+
+  def test_seed_module_and_submodules_are_reloaded(self):
+    seed = 'zzz_fake_pkg.stub_layer'
+    sys.modules[seed] = types.ModuleType(seed)
+    sys.modules[seed + '.inner'] = types.ModuleType(seed + '.inner')
+    got = AP._reload_candidates(seed)
+    self.assertIn(seed, got)
+    self.assertIn(seed + '.inner', got)
+
+  def test_generated_protos_are_NEVER_reloaded(self):
+    # Re-executing a _pb2 duplicates descriptor-pool entries and RAISES --
+    # that would turn a recoverable stall into a hard crash.
+    name = 'zzz_fake_grpc_service_pb2'
+    sys.modules[name] = types.ModuleType(name)
+    self.assertNotIn(name, AP._reload_candidates(None))
+
+  def test_pb_stubby_siblings_ARE_reloaded(self):
+    # The poison actually sits in the generated *_pb_stubby module, whose body
+    # dies at `_client_stub_base_class = ...`. Sparing it would defeat the fix.
+    name = 'zzz_fake_service_pb_stubby'
+    sys.modules[name] = types.ModuleType(name)
+    self.assertIn(name, AP._reload_candidates(None))
+
+  def test_unrelated_modules_are_spared(self):
+    # Scoped eviction, not sys.modules.clear(): the worker keeps running.
+    name = 'zzz_fake_numpy_lookalike'
+    sys.modules[name] = types.ModuleType(name)
+    self.assertNotIn(name, AP._reload_candidates(None))
+
+  def test_none_tombstones_are_evicted(self):
+    # A failed import really does leave `None` in sys.modules at runtime; the
+    # cast is only to satisfy the type checker, which types the dict as
+    # dict[str, ModuleType].
+    typing.cast(dict, sys.modules)['zzz_fake_tombstone'] = None
+    self.assertIn('zzz_fake_tombstone', AP._tombstone_names())
+    AP._heal_half_initialised_modules(None)
+    self.assertNotIn('zzz_fake_tombstone', sys.modules)
+
+  def test_heal_reloads_IN_PLACE_keeping_the_same_module_object(self):
+    # ★The whole point: pop+reimport builds a NEW dict, but the cached
+    # generated service class reads the OLD one via __globals__, so it would
+    # keep raising. Reload re-executes into the SAME object.
+    seed = 'zzz_stubby_inplace_probe'
+    mod = _install_real_module(self, seed)
+    AP._heal_half_initialised_modules(seed)
+    self.assertIs(sys.modules.get(seed), mod,
+                  'module object must survive healing (reload, not evict)')
+
+
+class FetchRetryTest(unittest.TestCase):
+  """fetch() retries ONCE on the poison shape, and not at all otherwise."""
+
+  def _provider_raising(self, errors):
+    """Provider whose stub_factory raises `errors` in order, then succeeds."""
+    calls = {'n': 0}
+
+    class _Details:
+      resource_pool_name = 'deepmind-dynamic-pool'
+      xborg_allotment_name = 'allot'
+
+    class _Req:
+      def __init__(self):
+        self.platforms = []
+        self.allowed_allotments = []
+        self.resource_pool = ''
+
+    def factory():
+      i = calls['n']
+      calls['n'] += 1
+      if i < len(errors):
+        raise errors[i]
+      class _Stub:
+        def GetCellAvailability(self, req):
+          del req
+          return _Resp([])  # no tiers -> empty availability
+      return _Stub()
+
+    prov = AP.AvailabilityProvider(
+        archs=['v7'],
+        market_json_path='/nonexistent-market.json',
+        stub_factory=factory,
+        alloc_resolver=lambda g: _Details(),
+        platform_enum=lambda arch: 101,
+        request_factory=_Req,
+    )
+    return prov, calls
+
+  def test_poisoned_fetch_retries_once_and_succeeds(self):
+    # THE FIX: first call poisoned, healing happens, second call succeeds.
+    _install_real_module(self, 'zzz_poison_stubby_probe')
+    prov, calls = self._provider_raising([AttributeError(_POISON_MSG)])
+    avail, _, _ = prov.fetch()
+    self.assertEqual(calls['n'], 2, 'expected exactly one retry')
+    self.assertEqual(avail, {})
+
+  def test_retry_happens_AT_MOST_once(self):
+    # If the second attempt fails too, the error propagates -- no retry storm,
+    # and the caller still sees a real exception rather than a silent stall.
+    _install_real_module(self, 'zzz_poison_stubby_probe2')
+    prov, calls = self._provider_raising(
+        [AttributeError(_POISON_MSG), AttributeError(_POISON_MSG)])
+    with self.assertRaises(AttributeError):
+      prov.fetch()
+    self.assertEqual(calls['n'], 2, 'must not retry more than once')
+
+  def test_nameerror_from_dead_module_body_IS_retried(self):
+    # The shape actually observed live: the stubby module body died before
+    # binding `_client_stub_base_class`, so every later call is a NameError.
+    _install_real_module(self, 'zzz_poison_stubby_probe3')
+    prov, calls = self._provider_raising(
+        [NameError("name '_client_stub_base_class' is not defined")])
+    prov.fetch()
+    self.assertEqual(calls['n'], 2, 'NameError poison must trigger one retry')
+
+  def test_unrelated_nameerror_is_NOT_retried(self):
+    prov, calls = self._provider_raising([NameError('something else entirely')])
+    with self.assertRaises(NameError):
+      prov.fetch()
+    self.assertEqual(calls['n'], 1)
+
+  def test_import_error_is_NOT_retried(self):
+    # Negative control: a real missing dependency must surface immediately.
+    prov, calls = self._provider_raising([ImportError('gRPC is not installed')])
+    with self.assertRaises(ImportError):
+      prov.fetch()
+    self.assertEqual(calls['n'], 1, 'ImportError must not trigger a retry')
+
+  def test_ordinary_rpc_error_is_NOT_retried(self):
+    prov, calls = self._provider_raising([RuntimeError('deadline exceeded')])
+    with self.assertRaises(RuntimeError):
+      prov.fetch()
+    self.assertEqual(calls['n'], 1)
+
+  def test_healthy_fetch_does_not_touch_sys_modules(self):
+    # The guard must be inert on the happy path.
+    before = set(sys.modules)
+    prov, calls = self._provider_raising([])
+    prov.fetch()
+    self.assertEqual(calls['n'], 1)
+    self.assertEqual(before - set(sys.modules), set())
 
 
 if __name__ == '__main__':

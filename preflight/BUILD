@@ -56,6 +56,7 @@ pytype_strict_library(
         ":preflight",
         ":topology",
         "//experimental/users/qiaos/tpu_utils:group_utils",
+        "//experimental/users/qiaos/tpu_utils:metro_util",
     ],
 )
 
@@ -82,6 +83,7 @@ pytype_strict_contrib_test(
     srcs = ["router_test.py"],
     deps = [
         ":capacity",
+        ":market",
         ":preflight",
         ":router",
         "//experimental/users/qiaos/tpu_utils:group_utils",

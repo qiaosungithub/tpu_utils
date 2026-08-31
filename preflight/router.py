@@ -52,6 +52,7 @@ import concurrent.futures
 import dataclasses
 from typing import Optional
 
+from google3.experimental.users.qiaos.tpu_utils import metro_util
 from google3.experimental.users.qiaos.tpu_utils.preflight import market
 from google3.experimental.users.qiaos.tpu_utils.preflight import preflight
 
@@ -101,6 +102,26 @@ _V5P_MULTIPLIER: dict[str, float] = {
 # it simply drops out of the candidate set for larger requests.
 _ARCH_PREF: dict[str, int] = {
     'v7': 0, 'v6p': 1, 'v6e': 2, 'v5p': 3, 'v4': 4, 'v5e': 5}
+
+# Preference between groups (allocs): which one to SPEND FIRST. Lower = preferred.
+# g3 (gdm-viscam-interns-dynamic) and g5 (vqfree-xm) are small dynamic pools
+# with their OWN credit balance and -- crucially -- NO share of the G9 income/10
+# cap that the budget gate enforces. Spending them first therefore preserves the
+# regulated G9 budget for when it is actually needed, at no extra credit cost.
+# g9 holds the big floor but every chip-hour there is billed against that 1/10
+# cap, so it is the LAST resort among otherwise-equal options, not the first.
+#
+# This is only a preference among candidates that are ALREADY equally runnable
+# and equal-status (it sits below `blocked` and GREEN/YELLOW in the sort key),
+# so it never routes a job somewhere it cannot actually run -- it only decides
+# WHOSE budget to draw when more than one group could take the job. Groups not
+# listed share the default and are chosen after g3/g5 but before nothing in
+# particular; the remaining tie-breaks (headroom, cost, arch) still decide.
+_GROUP_PREF: dict[int, int] = {
+    3: 0,   # gdm-viscam-interns-dynamic -- own balance, exempt from G9 1/10 cap
+    5: 0,   # vqfree-xm                  -- own balance, exempt from G9 1/10 cap
+}
+_GROUP_PREF_DEFAULT = 1   # everyone else, incl. g9 (billed against the 1/10 cap)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -218,11 +239,20 @@ def _candidate_options(target_power: float,
 
 def _evaluate_cells(arch: str, chips: int, tier: str,
                     verdict: preflight.Verdict,
-                    snapshot: market.MarketSnapshot) -> list[CellOffer]:
+                    snapshot: market.MarketSnapshot,
+                    metros: Optional[list[str]] = None) -> list[CellOffer]:
   """Join this combo's viable cells against the market, cheapest first.
 
   Only ``cap.cells_ok`` is considered: those are the cells that already hold
   enough obtainable chips, so a price on any other cell is not actionable.
+
+  ``metros`` (data-locality) is a HARD filter applied FIRST: a cell whose metro
+  is not in the allow-list is dropped before pricing, so the router can only
+  ever recommend an in-metro cell. When it empties the list the whole combo
+  yields no offer and drops out of the ranking -- that is what makes ``--power
+  --metro`` fail closed instead of silently roaming to a no-data cell. Metro is
+  resolved by the shared ``metro_util`` leaf, the same mapping the smart-cell
+  default path uses, so both agree on which cell sits in which metro.
 
   These prices drive COST and cell choice only. Blocking is decided once per
   combo from the pool-level price -- see ``_evaluate_block``.
@@ -231,6 +261,8 @@ def _evaluate_cells(arch: str, chips: int, tier: str,
   if not cap or not cap.cells_ok:
     return []
 
+  allowed = {m.strip().lower() for m in (metros or []) if m.strip()}
+
   # Pool-scoped lookup. capacity.py resolved the alloc's real pool; passing it
   # keeps another pool's market (which can be 60% dearer for the same cell) out
   # of the decision.
@@ -238,6 +270,8 @@ def _evaluate_cells(arch: str, chips: int, tier: str,
 
   offers: list[CellOffer] = []
   for cell_cap in cap.cells_ok:
+    if allowed and metro_util.metro_of(cell_cap.cell) not in allowed:
+      continue
     known = cell_cap.cell in prices
     price = prices.get(cell_cap.cell)
     offers.append(CellOffer(
@@ -321,6 +355,9 @@ def rank(candidates: list[Candidate], tier: str = 'PROD') -> list[Candidate]:
 
     1. blocked ascending   -- never put a limit-order-blocked combo on top.
     2. status  ascending   -- GREEN before YELLOW (RED never reaches here).
+    2c. group preference    -- PROD only; spend g3/g5 (own balance, exempt from
+                              the G9 income/10 cap) before g9 and the rest. See
+                              ``_GROUP_PREF``. Neutral at BATCH (free pool).
     3. headroom descending -- see the PROD/BATCH split below.
     3b. unverified asc     -- PROD only; quota==0 sinks. See below.
     4. cost_per_hour asc   -- chips * per-chip-hour price. Prefer cheap cells:
@@ -330,6 +367,15 @@ def rank(candidates: list[Candidate], tier: str = 'PROD') -> list[Candidate]:
     6. chips ascending     -- smaller footprint wins ties.
     7. floor descending    -- PROD only; a bigger claim breaks a cost tie.
     8. obtainable desc, then group id -- final tie-breaks; see below.
+
+  Step 2c (group preference) is placed ABOVE the economics (headroom, cost,
+  floor) on purpose: g3/g5 draw on their own credit balance and do NOT count
+  against the G9 income/10 budget the launch gate enforces, so spending them
+  first is strictly cheaper in the resource that is actually scarce. It sits
+  BELOW blocked+status so it can never promote a non-runnable or lower-
+  confidence (YELLOW-over-GREEN) placement just to save budget -- correctness
+  of placement still outranks whose budget pays. It is neutral at BATCH, where
+  every group draws from the same free pool and no floor/credit is spent.
 
   The PROD/BATCH difference in step 3 is deliberate and load-bearing:
 
@@ -375,12 +421,17 @@ def rank(candidates: list[Candidate], tier: str = 'PROD') -> list[Candidate]:
              if c.verdict.capacity else 0)
     unverified = 0 if (is_batch or quota > 0) else 1
     floor_rank = 0 if is_batch else -quota
+    # Whose budget to spend first. Neutral at BATCH (one free pool, nothing is
+    # spent), active at PROD where g3/g5 are exempt from the G9 income/10 cap.
+    group_pref = (0 if is_batch
+                  else _GROUP_PREF.get(c.group_id, _GROUP_PREF_DEFAULT))
     # Unknown price sorts after every known one, so a priced cheap cell always
     # beats an unpriced guess.
     cost = float('inf') if c.cost_per_hour is None else c.cost_per_hour
     return (
         1 if c.blocked else 0,                        # ascending: 0 = runnable
         status_rank.get(c.verdict.status.value, 99),  # ascending: 0 = GREEN
+        group_pref,                                   # ascending: g3/g5 first
         -headroom,                                    # descending
         unverified,                                   # ascending: verified 1st
         cost,                                         # ascending: cheap first
@@ -405,7 +456,8 @@ def route(power: str,
           tolerance: float = 0.5,
           top_k: int = 3,
           progress_fn=None,
-          snapshot: Optional[market.MarketSnapshot] = None
+          snapshot: Optional[market.MarketSnapshot] = None,
+          metros: Optional[list[str]] = None
           ) -> tuple[list[Candidate], market.MarketSnapshot]:
   """Main entry point.
 
@@ -419,6 +471,11 @@ def route(power: str,
     progress_fn: optional (str) -> None for streaming progress messages.
     snapshot:  pre-loaded market data; loaded from the daemon cache if omitted.
                Injectable so tests can pin prices without a running daemon.
+    metros:    data-locality allow-list of metros (e.g. ['cbf', 'tul']). When
+               set, ONLY cells in those metros are eligible; a combo with no
+               in-metro cell drops out entirely, so the result is empty rather
+               than out-of-metro when the whole allow-list is full. Default
+               None/[] = any metro (roams the fleet, today's behaviour).
 
   Returns ``(candidates, snapshot)``. Candidates are sorted best first and may
   include entries with ``blocked=True`` when nothing is runnable -- the caller
@@ -494,12 +551,25 @@ def route(power: str,
           progress_fn(f"  [{completed}/{total}] g{gid} {tpu_type} -> {s}")
         continue
 
+      # Per-cell offers, with the metro allow-list (data-locality) applied as a
+      # HARD filter first. When ``metros`` is set and empties the list, the
+      # combo has no in-metro cell: drop it entirely so it can neither rank nor
+      # be recommended. That is the fail-closed half of --power --metro -- an
+      # all-full allow-list yields an empty RESULT rather than an out-of-metro
+      # (no-data) recommendation the dataloader would crash on.
+      offers = _evaluate_cells(arch, chips, tier, verdict, snapshot,
+                               metros=metros)
+      if metros and not offers:
+        if progress_fn:
+          progress_fn(f"  [{completed}/{total}] g{gid} {tpu_type} -> "
+                      f"no cell in metro(s) {','.join(metros)}")
+        continue
+
       # Two independent questions, deliberately answered from two different
       # numbers: the pool-level price decides whether a cap blocks the combo,
       # the per-cell prices decide where to run and what it costs.
       blocked, block_reason, pool_price, limit_order = _evaluate_block(
           alloc, arch, tier, verdict, snapshot)
-      offers = _evaluate_cells(arch, chips, tier, verdict, snapshot)
       best = _pick_offer(offers)
 
       if progress_fn:
@@ -531,9 +601,11 @@ def route_all(power: str, tier: str = 'PROD',
               groups: Optional[list[int]] = None,
               tolerance: float = 0.5,
               progress_fn=None,
-              snapshot: Optional[market.MarketSnapshot] = None
+              snapshot: Optional[market.MarketSnapshot] = None,
+              metros: Optional[list[str]] = None
               ) -> tuple[list[Candidate], market.MarketSnapshot]:
   """``route`` with no top-K truncation. Used by --explain, which must be able
   to list the combos that were excluded as well as the ones that survived."""
   return route(power=power, tier=tier, groups=groups, tolerance=tolerance,
-               top_k=1 << 30, progress_fn=progress_fn, snapshot=snapshot)
+               top_k=1 << 30, progress_fn=progress_fn, snapshot=snapshot,
+               metros=metros)
