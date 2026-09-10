@@ -698,6 +698,58 @@ def _cell_from_log(tpu_info):
     return ''
 
 
+@functools.lru_cache(maxsize=1)
+def _queue_cell_map():
+    """xid -> the Borg cell the router placed the job on, from the local queue.
+
+    The smart-router queue file records the cell it pinned each job to. This is
+    the ONLY cell source that covers a single-host GPU job, whose CNS artifacts
+    (no tfevents, no BNS in the mirrored log) name no cell at all. Operator-
+    scoped by the same `TPU_LOCAL_QUEUE_FILE` every other consumer reads; unset
+    falls back to the historical path. Read once per render and memoised -- the
+    board draws many jobs from one file. Never raises.
+    """
+    path = os.path.expanduser(
+        os.environ.get('TPU_LOCAL_QUEUE_FILE') or '~/.tpu_local_queue.json')
+    out = {}
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        for entry in (data.get('entries') or []):
+            xid = str(entry.get('xid') or '')
+            cell = entry.get('cell') or ''
+            if xid and cell:
+                out[xid] = cell
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def _cell_from_tfevents(bucket):
+    """Borg cell out of a tfevents filename under `bucket`, or ''. Never raises.
+
+    TensorBoard event files are named `events.out.tfevents.<ts>.<...>.qiaos.
+    <cell>.borg.google.com.<pid>...`, so the writing task's cell is embedded
+    even when nothing else on CNS names it. This is ELT's source: it writes
+    tfevents to the bucket root but mirrors no rank log. One `iterdir()`; the
+    `vi*` routing-alias hostnames are skipped.
+    """
+    if not bucket:
+        return ''
+    try:
+        from etils import epath
+        for child in epath.Path(bucket).iterdir():
+            name = child.name
+            if 'tfevents' not in name:
+                continue
+            m = re.search(r'\.([a-z0-9-]+)\.borg\.google\.com', name)
+            if m and not m.group(1).startswith('vi'):
+                return m.group(1)
+        return ''
+    except Exception:  # pylint: disable=broad-except
+        return ''
+
+
 # mach_locality's continent codes -> what a person calls the place. The codes
 # ('na', 'eu', 'ap') are precise and unreadable at a glance, which is the whole
 # problem this column exists to solve.
@@ -744,7 +796,7 @@ def _locality(cell):
     return out
 
 
-def _region_of(work_units, tpu_info):
+def _region_of(work_units, tpu_info, xid=None):
     """Where compute landed, flagged when it is not where the data lives.
 
     Rendered as `<cell>/<metro>`, e.g. `yuskedq/ske`. Borg names cells, not GCP
@@ -770,14 +822,22 @@ def _region_of(work_units, tpu_info):
         if cell:
             break
 
+    # `borg_job_states` comes back EMPTY for a live work unit (verified against
+    # XID 275990419: states: 0), so in practice the fallbacks below are what
+    # fill this column. They run cheapest-first, each covering a family the
+    # others cannot see.
+    if not cell and xid is not None:
+        # The router recorded the cell it pinned this job to. A local JSON read,
+        # and the only source that names a single-host GPU job's cell.
+        cell = _queue_cell_map().get(str(xid), '')
     if not cell:
-        # Fallback: the job's own log. `borg_job_states` comes back EMPTY for a
-        # live work unit (verified against XID 275990419: states: 0), but the
-        # application prints the JAX coordinator BNS at startup, and a BNS path
-        # carries the cell:
-        #     /bns/viglobal/borg/viglobal/bns/qiaos/qiaos_group_<XID>.<WID>.main/0:jax
-        #                                                     ^ that is a routing
-        # alias, so prefer a concrete `/bns/<cell>/borg/<cell>/` when present.
+        # A tfevents filename embeds the writing task's cell. One CNS iterdir();
+        # this is what fills ELT, which mirrors no rank log.
+        cell = _cell_from_tfevents((tpu_info or {}).get('bucket_cp_path') or '')
+    if not cell:
+        # Last resort: the mirrored rank log's `Compute cluster:` line or a
+        # concrete `/bns/<cell>/borg/<cell>/` (skipping the viglobal routing
+        # alias). A 200 KB CNS read, so it runs only when the above are empty.
         cell = _cell_from_log(tpu_info)
 
     if not cell:
@@ -876,43 +936,121 @@ def _restart_count(wu):
 
 
 _STEP_DIR_RE = re.compile(r'^step_(\d+)(?:_.*)?$')
+_BARE_INT_RE = re.compile(r'^\d+$')
+# Torch line-logs: `[parcae-torch] step   2229  loss ...`. Tolerates the
+# `step 100/1000` and `global_step=5` spellings too.
+_LOG_STEP_RE = re.compile(r'\bstep[ _=:]*(\d+)\b')
+# raft JSONL rows: `{"step": 72000, "steps_per_s": ...}` -- the quoted key
+# anchors on the real counter, never on `steps_per_s`/`num_steps`.
+_JSONL_STEP_RE = re.compile(r'"step"\s*:\s*(\d+)')
 
 
-def _progress_step(tpu_info):
-    """Highest COMPLETE checkpoint step this job has written, else 0.
+def _step_from_checkpoints(root):
+    """Highest COMPLETE checkpoint step under `<root>/checkpoints`, else 0.
 
-    unified_infra derives the same number by grepping each attempt's
-    `output.log` for `saved to ... step_N` (infra/resume.py:34). We enumerate
-    the checkpoint bucket instead: it is the same source of truth the job's own
-    auto-resume consults, and unlike a log it cannot rotate away. A directory
-    without `extra.json` was still being written when the task died and does
-    not count -- the same completeness rule unified_infra applies when it
-    ignores a bare `Saving` with no matching `saved to`.
+    Two on-disk layouts coexist and both are recognised here:
 
-    Returns 0 when nothing has been saved yet, matching the "no step grepped
-    means 0" convention.
+    * EqR-jax / codi: `step_<N>/` finalized by an `extra.json` marker.
+    * ELT orbax: a BARE-INTEGER dir `<N>/` finalized by `_CHECKPOINT_METADATA`.
+
+    The marker is the completeness gate -- a dir with neither was still being
+    written when the task died (orbax also leaves a `<N>.orbax-checkpoint-tmp-*`
+    that matches no pattern here), the same rule the job's own auto-resume
+    applies. Candidates are checked highest-first, so the common case is a
+    single stat().
+    """
+    try:
+        from etils import epath
+        ckpt = epath.Path(root + '/checkpoints')
+        if not ckpt.is_dir():
+            return 0
+        candidates = []
+        for child in ckpt.iterdir():
+            name = child.name
+            m = _STEP_DIR_RE.match(name)
+            if m:
+                candidates.append((int(m.group(1)), child))
+            elif _BARE_INT_RE.match(name):
+                candidates.append((int(name), child))
+        for step, child in sorted(candidates, reverse=True):
+            if (child / 'extra.json').exists() or \
+               (child / '_CHECKPOINT_METADATA').exists():
+                return step
+        return 0
+    except Exception:  # pylint: disable=broad-except
+        return 0
+
+
+def _step_from_runs(root):
+    """Highest step across `<root>/runs/<name>/train_log.jsonl`, else 0.
+
+    The raft port writes one JSONL per run and NO step-named checkpoint dir, so
+    this is its only progress source. Runs launch together and advance in
+    lockstep, so a bounded sample (first few) and the max over it is a faithful
+    'how far along'. Each file is tail-read, never downloaded whole.
+    """
+    try:
+        from etils import epath
+        runs = epath.Path(root + '/runs')
+        if not runs.is_dir():
+            return 0
+        best = 0
+        for i, run in enumerate(sorted(runs.iterdir())):
+            if i >= 4:  # bound the serial fan-out; runs move in lockstep
+                break
+            log = run / 'train_log.jsonl'
+            try:
+                if not log.is_file():
+                    continue
+                with log.open('rb') as fh:
+                    try:
+                        fh.seek(-4096, os.SEEK_END)
+                    except OSError:
+                        pass  # file shorter than the window; read it whole
+                    tail = fh.read().decode('utf-8', errors='replace')
+            except Exception:  # noqa: BLE001 - a vanished run is not fatal
+                continue
+            for m in _JSONL_STEP_RE.finditer(tail):
+                best = max(best, int(m.group(1)))
+        return best
+    except Exception:  # pylint: disable=broad-except
+        return 0
+
+
+def _progress_step(tpu_info, log_tail=''):
+    """Highest COMPLETE training step this job has reached, else 0.
+
+    Four families record progress four different ways, so this consults each in
+    turn, cheapest first, stopping at the first that answers:
+
+    1. checkpoint dirs -- `step_<N>/`+`extra.json` (EqR/codi) or bare-int
+       `<N>/`+`_CHECKPOINT_METADATA` (ELT orbax). See `_step_from_checkpoints`.
+    2. the mirrored rank-log tail ALREADY fetched for the board -- torch ports
+       (parcae) print `step <N>` and write no step-named dir, so the log is the
+       only source. Free: the tail is passed in, no extra read.
+    3. `runs/<name>/train_log.jsonl` -- the raft port. See `_step_from_runs`.
+       Only reached when the two cheaper sources are empty.
+
+    unified_infra greps each attempt's `output.log` for `saved to ... step_N`;
+    the checkpoint enumeration here is the same source of truth the job's own
+    auto-resume consults and, unlike a log, cannot rotate away. Returns 0 when
+    nothing is found, matching the historical convention. Never raises.
     """
     bucket = (tpu_info.get('bucket_cp_path') or '').strip()
     if not bucket:
         return 0
-    root = bucket.rstrip('/') + '/checkpoints'
-    try:
-        from etils import epath
-        path = epath.Path(root)
-        if not path.is_dir():
-            return 0
-        best = 0
-        for child in path.iterdir():
-            match = _STEP_DIR_RE.match(child.name)
-            if not match:
-                continue
-            step = int(match.group(1))
-            if step > best and (child / 'extra.json').exists():
-                best = step
-        return best
-    except Exception:  # pylint: disable=broad-except
-        # Never let a storage hiccup break the status board.
-        return 0
+    root = bucket.rstrip('/')
+
+    step = _step_from_checkpoints(root)
+    if step:
+        return step
+
+    if log_tail:
+        hits = _LOG_STEP_RE.findall(log_tail)
+        if hits:
+            return max(int(h) for h in hits)
+
+    return _step_from_runs(root)
 
 
 def main(argv):
@@ -1071,7 +1209,12 @@ def main(argv):
 
         name = exp.name if exp.name else str(exp_id)
         job_info = tpu_jobs_map.get(str(exp_id), {})
-        step_str = str(_progress_step(job_info))
+        # The raw rank-log tail is already prefetched for the board; hand it to
+        # _progress_step so a torch port whose only step source is its log costs
+        # no extra read.
+        _raw_tail = log_tails.get(
+            (job_info.get('bucket_cp_path') or '').strip(), '')
+        step_str = str(_progress_step(job_info, log_tail=_raw_tail))
         if not work_units:
             # Do NOT call this a config error. A freshly-submitted experiment has
             # no work units for the first minute or so -- XManager creates the
@@ -1124,7 +1267,7 @@ def main(argv):
         # like they were still queued for hours.
         if is_running:
             details = f"{len([w for w in work_units if 'running' in w.status_name.lower()])} active"
-            region = _region_of(work_units, job_info)
+            region = _region_of(work_units, job_info, xid=exp_id)
             table_running.add_row(str(exp_id), "[green]running[/green]", name[:50],
                                   resume_str, step_str, region, details)
             # Second row per run: what the job is actually SAYING. A status of
