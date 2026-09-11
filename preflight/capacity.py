@@ -64,6 +64,14 @@ class CapacityResult:
   # thinks of as 'my quota'.
   alloc_scoped_quota: int = 0
   alloc_scoped_used: int = 0
+  # False when the floor_v2 read FAILED (RPC error, unknown tier), as opposed
+  # to succeeding and reporting no floor. Both used to arrive as quota == 0,
+  # which printed as a confident "0" in the router table and was read as "this
+  # alloc has no capacity" -- an instrument failure wearing the costume of a
+  # world state. Anything that DISPLAYS quota must branch on this; anything
+  # that RANKS on it may keep treating unreadable as zero, which is the
+  # conservative direction.
+  quota_readable: bool = True
   # The GQM ResourcePool this alloc lives in (e.g. 'deepmind-dynamic-pool').
   # Carried out of the check because market prices and limit orders are BOTH
   # keyed by pool: the same (cell, chip, tier) cleared at 20.20 credits in
@@ -134,13 +142,7 @@ def _extract_cells(resp, tier: str, platform_key_enum: int) -> list[CellCapacity
   """
   want_tier_enum = _TIER_ENUM.get(tier.upper())
   cells: dict[str, CellCapacity] = {}
-  # Live opportunistic ceiling per cell, read from the pool-level
-  # `max_available_chips` (DynamicPoolAvailability field 2 / StaticPool field 3).
-  # This is the market-level free-chip count (within-floor + acquirable), which
-  # for a free-pool arch like GB200 is far larger than the per-allotment
-  # `obtainable_capacity` forecast -- folding it in stops a healthy free pool
-  # from being flagged RED purely because the allotment's obtainable is low.
-  free_by_cell: dict[str, int] = {}
+
   def _walk_tiered(tiered_list):
     for tier_bucket in tiered_list:
       if tier_bucket.tier != want_tier_enum:
@@ -166,31 +168,10 @@ def _extract_cells(resp, tier: str, platform_key_enum: int) -> list[CellCapacity
                   prev,
                   within_floor=prev.within_floor + chips,
                   obtainable=prev.obtainable + chips)
-      # Pool-level max_available_chips: same CellAvailability shape, but hangs
-      # directly off `availability` (not per-allotment). Sum matching-platform
-      # chips per cell into free_by_cell.
-      for cell_av in (getattr(av, 'max_available_chips', None) or []):
-        cell = cell_av.cell
-        for ptcc in cell_av.platform_to_chip_counts:
-          if ptcc.platform != platform_key_enum:
-            continue
-          free_by_cell[cell] = free_by_cell.get(cell, 0) + int(ptcc.num_chips)
 
   _walk_tiered(resp.tiered_dynamic_pool_availabilities)
   _walk_tiered(resp.tiered_static_pool_availabilities)
 
-  # Fold the live free-chip ceiling into each cell's max_available. A cell that
-  # only shows up in max_available_chips (no allotment obtainable) still becomes
-  # a candidate; a cell present in both takes the larger of the two.
-  for cell, free in free_by_cell.items():
-    prev = cells.get(cell)
-    if prev is None:
-      cells[cell] = CellCapacity(
-          cell=cell, tier=tier, within_floor=0,
-          max_available=free, obtainable=0)
-    else:
-      cells[cell] = dataclasses.replace(
-          prev, max_available=max(prev.max_available, free))
   return list(cells.values())
 
 
@@ -245,39 +226,32 @@ def check_capacity(alloc: str, tier: str, xm_accelerator_key: str,
     # It is a fallback rather than the primary source because it costs a much
     # slower RPC (~25 s vs ~1 s) and is a forecast rather than a live figure.
     cells = _fetch_forecast_cells(alloc, tier, xm_accelerator_key)
-  # Effective placeable chips per cell = max of the allotment obtainable-capacity
-  # forecast and the live pool-level free ceiling (max_available). A free-pool
-  # arch (e.g. GB200) can have a tiny allotment obtainable but a large live free
-  # pool; using only obtainable would flag it RED even though a job would place.
-  def _eff(c: CellCapacity) -> int:
-    return max(c.obtainable, c.max_available)
-
-  cells_ok = tuple(sorted([c for c in cells if _eff(c) >= chips_required],
-                          key=lambda c: -_eff(c)))
-  cells_insufficient = tuple(sorted([c for c in cells if 0 < _eff(c) < chips_required],
-                                    key=lambda c: -_eff(c)))
+  cells_ok = tuple(sorted([c for c in cells if c.obtainable >= chips_required],
+                          key=lambda c: -c.obtainable))
+  cells_insufficient = tuple(sorted([c for c in cells if 0 < c.obtainable < chips_required],
+                                    key=lambda c: -c.obtainable))
   total_cap = sum(c.within_floor for c in cells)
-  total_obt = sum(_eff(c) for c in cells)
+  total_obt = sum(c.obtainable for c in cells)
 
   # Alloc-scoped quota (via floor_v2): what the user sees in tpu quota.
   # This is stricter than the pool-wide obtainable_capacity from GoodputService.
-  alloc_quota, alloc_used = _fetch_alloc_scoped_quota(
+  alloc_quota, alloc_used, quota_readable = _fetch_alloc_scoped_quota(
       alloc, tier, xm_accelerator_key)
 
   warnings = []
   if not cells_ok:
     hard_error = (
-        f"No cell in {alloc} at {tier} has {chips_required} available "
-        f"(max of obtainable-forecast and live-free) "
-        f"{xm_accelerator_key} chips. Total available across "
+        f"No cell in {alloc} at {tier} has {chips_required} obtainable "
+        f"{xm_accelerator_key} chips. Total obtainable across "
         f"{len(cells)} cells: {total_obt}.")
     if cells_insufficient:
-      top_hint = ', '.join(f'{c.cell}:{_eff(c)}' for c in cells_insufficient[:5])
+      top_hint = ', '.join(f'{c.cell}:{c.obtainable}' for c in cells_insufficient[:5])
       hard_error += f" Top cells (chips available): {top_hint}."
     return CapacityResult(
         ok=False, cells_ok=(), cells_insufficient=cells_insufficient,
         total_pool_capacity=total_cap, total_obtainable=total_obt,
         alloc_scoped_quota=alloc_quota, alloc_scoped_used=alloc_used,
+        quota_readable=quota_readable,
         pool=pool, hard_error=hard_error, warnings=tuple(warnings))
 
   # Heuristic: warn if the user's own alloc quota is thin vs the request.
@@ -292,14 +266,21 @@ def check_capacity(alloc: str, tier: str, xm_accelerator_key: str,
           f"If quota was granted per cell, submission may still fail on a "
           f"single-cell shortage even though the sum is enough.")
   elif tier.upper() == 'PROD' and alloc_quota == 0:
-    warnings.append(
-        f"Could not read PROD quota for {xm_accelerator_key} in {alloc} "
-        f"(floor_v2 reported 0). Cannot verify headroom.")
+    if quota_readable:
+      warnings.append(
+          f"{alloc} holds no PROD floor for {xm_accelerator_key} "
+          f"(floor_v2 read OK, reported 0). It can still run here on the "
+          f"market; there is just no guaranteed claim to verify against.")
+    else:
+      warnings.append(
+          f"Could not read PROD quota for {xm_accelerator_key} in {alloc} "
+          f"(floor_v2 lookup FAILED). Headroom is unknown, not zero.")
 
   return CapacityResult(
       ok=True, cells_ok=cells_ok, cells_insufficient=cells_insufficient,
       total_pool_capacity=total_cap, total_obtainable=total_obt,
       alloc_scoped_quota=alloc_quota, alloc_scoped_used=alloc_used,
+      quota_readable=quota_readable,
       pool=pool, warnings=tuple(warnings))
 
 
@@ -367,11 +348,15 @@ def _fetch_forecast_cells(alloc: str, tier: str,
   return out
 
 
-_quota_cache: dict[tuple[str, str, str], tuple[float, tuple[int, int]]] = {}
+# Value is (timestamp, (quota, used, readable)). Only SUCCESSFUL reads are
+# stored, so the cached `readable` is always True; a failed read returns
+# without touching the cache, which is what lets the next call retry.
+_quota_cache: dict[tuple[str, str, str],
+                   tuple[float, tuple[int, int, bool]]] = {}
 
 
 def _fetch_alloc_scoped_quota(alloc: str, tier: str,
-                              xm_accelerator_key: str) -> tuple[int, int]:
+                              xm_accelerator_key: str) -> tuple[int, int, bool]:
   """Reads this alloc's own guaranteed floor and its live usage.
 
   Quota comes from ``ResourceAllocationDetails.floor_v2``, which is scoped to
@@ -381,13 +366,16 @@ def _fetch_alloc_scoped_quota(alloc: str, tier: str,
   alloc's quota by orders of magnitude and are nearly identical across every
   group sharing that pool.
 
-  Returns (quota, used) as integer chip counts. Returns (0, 0) if the call
-  fails or the alloc/type has no quota.
+  Returns (quota, used, readable) as integer chip counts plus a flag that is
+  False when the lookup FAILED. A failed read and a genuine absence of floor
+  both yield quota == 0 and are NOT the same fact: the third element is the
+  only thing that tells them apart, and a caller that displays the number must
+  branch on it rather than printing a confident 0.
   """
   tier_map = {'PROD': 'HighlyAvailable', 'BATCH': 'NonProd', 'SPOT': 'BestEffort'}
   p_name = tier_map.get(tier.upper())
   if not p_name:
-    return (0, 0)
+    return (0, 0, False)
   ck = (alloc, p_name, xm_accelerator_key)
   now = time.time()
   hit = _quota_cache.get(ck)
@@ -407,8 +395,10 @@ def _fetch_alloc_scoped_quota(alloc: str, tier: str,
       used = int(chips_u)
     except Exception:
       pass
-    result = (quota, used)
+    result = (quota, used, True)
     _quota_cache[ck] = (now, result)
     return result
   except Exception:
-    return (0, 0)
+    # Deliberately NOT cached: a transient RPC failure must not pin "unknown"
+    # for the whole TTL when the next call would succeed.
+    return (0, 0, False)

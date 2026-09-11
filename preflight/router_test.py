@@ -249,6 +249,48 @@ check('metro tokens are whitespace- and case-insensitive',
       [o.cell for o in _ws], ['yucbfiv'])
 
 print()
+print('--- an explicit --groups turns OFF the g3/g5 budget preference ---')
+# g9 is better on the economics (real floor, cheaper); g3 wins only because
+# _GROUP_PREF sits above headroom in the sort key. That is right when the
+# router is choosing whose budget to spend, and wrong when the caller already
+# said which group they are pinned to.
+_g9_better = _cand(9, 'v6e', 32, quota=256, price=1.0)
+_g3_worse = _cand(3, 'v6e', 32, quota=0, price=9.0)
+check('default (no --groups): g3/g5 preference still applies',
+      [c.group_id for c in router.rank([_g9_better, _g3_worse],
+                                       tier='PROD')],
+      [3, 9])
+check('explicit --groups: ranked on merit, g9 first',
+      [c.group_id for c in router.rank([_g9_better, _g3_worse], tier='PROD',
+                                       groups_were_explicit=True)],
+      [9, 3])
+check('explicit --groups is neutral at BATCH too (already neutral)',
+      [c.group_id for c in router.rank([_g9_better, _g3_worse], tier='BATCH',
+                                       groups_were_explicit=True)],
+      [c.group_id for c in router.rank([_g9_better, _g3_worse],
+                                       tier='BATCH')])
+
+print()
+print('--- an unreadable floor is not a zero floor ---')
+_unreadable = capacity.CapacityResult(
+    ok=True, cells_ok=(), cells_insufficient=(), total_pool_capacity=0,
+    total_obtainable=0, alloc_scoped_quota=0, alloc_scoped_used=0,
+    quota_readable=False, pool='deepmind-dynamic-pool')
+_no_floor = capacity.CapacityResult(
+    ok=True, cells_ok=(), cells_insufficient=(), total_pool_capacity=0,
+    total_obtainable=0, alloc_scoped_quota=0, alloc_scoped_used=0,
+    quota_readable=True, pool='deepmind-dynamic-pool')
+check('a read FAILURE is distinguishable from a real zero',
+      (_unreadable.quota_readable, _no_floor.quota_readable), (False, True))
+check('both still carry quota == 0, so ranking is unchanged',
+      (_unreadable.alloc_scoped_quota, _no_floor.alloc_scoped_quota), (0, 0))
+check('quota_readable defaults to True, so existing callers are unaffected',
+      capacity.CapacityResult(
+          ok=True, cells_ok=(), cells_insufficient=(), total_pool_capacity=0,
+          total_obtainable=0).quota_readable,
+      True)
+
+print()
 if fails:
   print(f'FAILED {len(fails)}:')
   for f in fails:

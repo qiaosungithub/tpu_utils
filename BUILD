@@ -171,6 +171,7 @@ pytype_strict_binary(
     srcs = ["dump_wu_status.py"],
     deps = [
         "//learning/deepmind/xmanager2/client:xmanager_api",
+        "//third_party/py/absl:app",
     ],
 )
 
@@ -206,11 +207,37 @@ pytype_strict_library(
 pytype_strict_library(
     name = "route_lib",
     srcs = ["route_lib.py"],
+    # Both are imported inside a try/except ImportError, so a missing dep does
+    # not crash -- it silently returns None, i.e. "no price cap for this arch"
+    # and "this cell passes the metro filter". Undeclared, they were absent
+    # from the built binary and both guards were dead while every call looked
+    # like it succeeded. Declared here so the fallback stays what it is for --
+    # running route_lib.py as a bare script -- rather than the normal case.
+    deps = [
+        ":cap_policy",
+        ":cell_locality",
+    ],
 )
 
 pytype_strict_contrib_test(
     name = "route_lib_test",
     srcs = ["route_lib_test.py"],
+    deps = [
+        ":route_lib",
+    ],
+)
+
+# ELT auto-warm-restart resume-mechanism split, unit-tested in isolation.
+# route_lib.build_warm_restart_entry must emit restart_from+restart_step for an
+# ELT checkpoints/<int> leaf and load_from for every other layout (see the fn's
+# docstring + elt_dit_pkg/load_from_guard.py). Self-asserting, EqR-jax style:
+# prints ELT_RESTART_OK on success. SEPARATE from route_lib_test.py on purpose
+# (that file is owned by the concurrent scheduler-rewrite change), so the two do
+# not collide. Run: blaze run :eltrestart_test
+pytype_binary(
+    name = "eltrestart_test",
+    srcs = ["eltrestart_test.py"],
+    main = "eltrestart_test.py",
     deps = [
         ":route_lib",
     ],
@@ -254,6 +281,10 @@ pytype_strict_library(
     srcs = ["route_check.py"],
     deps = [
         ":avail_provider",
+        # The disk-liveness probe resolves a job's write location the way the
+        # launcher does -- explicit --bucket first, else the landing cell
+        # through the measured locality table -- so it needs the same table.
+        ":cell_locality",
         ":route_lib",
         "//learning/deepmind/xmanager2/client:xmanager_api",
         "//third_party/py/absl:app",
@@ -274,6 +305,34 @@ pytype_strict_contrib_test(
         ":avail_provider",
         ":route_check_lib",
         ":route_lib",
+    ],
+)
+
+# Cell selection ranks by effective price (per-cell price / slice bonus x
+# eviction penalty), not by roominess alone. Negative controls: the roomier
+# cell still wins inside the bonus, the bonus has a hard ceiling, the eviction
+# penalty decays to nothing in half an hour and is inert with no record, and
+# the hard gates (oversold / cooldown / limit-order cap) outrank every score.
+pytype_strict_contrib_test(
+    name = "cellscore_test",
+    srcs = ["cellscore_test.py"],
+    deps = [
+        ":route_lib",
+        "//testing/pybase",
+    ],
+)
+
+# A caller's alloc-group PIN beats the g5/g3-first preference (operator GO
+# 2026-08-31 10:2xZ). Four negative controls: an unpinned job still picks g5,
+# a blank pin is not a pin, a pinned job still obeys the g9 income/10 bar, and
+# only ONE --group= ever reaches XM.
+pytype_strict_contrib_test(
+    name = "grouppin_test",
+    srcs = ["grouppin_test.py"],
+    deps = [
+        ":route_check_lib",
+        ":route_lib",
+        "//testing/pybase",
     ],
 )
 
@@ -462,11 +521,57 @@ pytype_strict_contrib_test(
 )
 
 pytype_strict_contrib_test(
+    name = "cooldownweight_test",
+    srcs = ["cooldownweight_test.py"],
+    deps = [
+        ":route_lib",
+        "//testing/pybase",
+    ],
+)
+
+pytype_strict_contrib_test(
+    name = "archcooldown_test",
+    srcs = ["archcooldown_test.py"],
+    deps = [
+        ":route_lib",
+        "//testing/pybase",
+    ],
+)
+
+pytype_strict_contrib_test(
+    name = "reroutebackoff_test",
+    srcs = ["reroutebackoff_test.py"],
+    deps = [
+        ":route_check_lib",
+        ":route_lib",
+        "//testing/pybase",
+    ],
+)
+
+pytype_strict_contrib_test(
+    name = "gonezombie_test",
+    srcs = ["gonezombie_test.py"],
+    deps = [
+        ":route_check_lib",
+        ":route_lib",
+        "//testing/pybase",
+    ],
+)
+
+pytype_strict_contrib_test(
     name = "groupdup_test",
     srcs = ["groupdup_test.py"],
     deps = [
         ":route_check_lib",
         ":route_lib",
         "//testing/pybase",
+    ],
+)
+pytype_strict_binary(
+    name = "probe13_scratch",
+    srcs = ["probe13_scratch.py"],
+    deps = [
+        "//learning/deepmind/xmanager2/client:xmanager_api",
+        "//third_party/py/absl:app",
     ],
 )

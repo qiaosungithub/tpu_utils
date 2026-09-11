@@ -103,6 +103,12 @@ _V5P_MULTIPLIER: dict[str, float] = {
 _ARCH_PREF: dict[str, int] = {
     'v7': 0, 'v6p': 1, 'v6e': 2, 'v5p': 3, 'v4': 4, 'v5e': 5}
 
+# ★Preference AMONG GPUs: biggest card first (operator, 2026-09-03). Kept
+# separate from _ARCH_PREF because it enters the sort key at a different, much
+# higher position -- above price -- whereas _ARCH_PREF is a late tie-break.
+# Absent (== 0) for every TPU, which leaves TPU ordering exactly as it was.
+_GPU_PREF: dict[str, int] = {'b200': 1, 'h100': 2}
+
 # Preference between groups (allocs): which one to SPEND FIRST. Lower = preferred.
 # g3 (gdm-viscam-interns-dynamic) and g5 (vqfree-xm) are small dynamic pools
 # with their OWN credit balance and -- crucially -- NO share of the G9 income/10
@@ -217,6 +223,30 @@ def parse_power_input(power: str) -> float:
                    f"Expected 'v6e-16', 'v5p-32', or a bare integer.")
 
 
+def parse_gpu_request(power: str) -> Optional[tuple[str, int]]:
+  """``('h100', 8)`` if ``power`` names a GPU slice, else ``None``.
+
+  ★Must be consulted BEFORE ``parse_power_input``, which converts any spec to
+  a v5p-equivalent float and thereby throws away the one fact that decides the
+  whole route: that the caller asked for a GPU. Once 'h100-8' has become 17.2,
+  nothing downstream can tell it from a TPU request for the same compute, and
+  the router will happily offer a v6e slice for a CUDA job.
+  """
+  from google3.experimental.users.qiaos.tpu_utils.preflight import topology
+  s = power.strip().lower()
+  for sep in ('-', '='):
+    if sep in s:
+      arch, cores = s.split(sep, 1)
+      if topology.is_gpu(arch):
+        try:
+          return arch, int(cores)
+        except ValueError:
+          raise ValueError(
+              f"power spec '{power}' has non-integer device count")
+      return None
+  return None
+
+
 def _candidate_options(target_power: float,
                        tolerance: float = 0.5
                        ) -> list[tuple[str, int]]:
@@ -234,6 +264,37 @@ def _candidate_options(target_power: float,
       p = to_power(arch, chips)
       if low <= p <= high:
         out.append((arch, chips))
+  return out
+
+
+def _gpu_candidate_options(chips: int) -> list[tuple[str, int]]:
+  """GPU options for a GPU request, BIGGEST CARD FIRST.
+
+  ★TWO RULES, AND THEY ARE THE OPPOSITE OF THE TPU ONES (operator, 2026-09-03):
+
+  1. A GPU JOB ONLY EVER RUNS ON A GPU. The TPU path above answers "what else
+     has this much compute", which is right when the work is portable and
+     catastrophic when it is not: a CUDA binary power-matched onto a v5e slice
+     does not run slowly, it does not run. So this function never emits a TPU,
+     and ``route`` never mixes the two candidate sets.
+  2. TAKE THE BIGGEST CARD THAT CLEARS ITS CAP, not the equal-compute one.
+     B200 is ~2.3x an H100 per device (4.90 vs 2.15 v5p-units), so the TPU
+     habit of matching compute would answer "b200-4 == h100-8" and hand back
+     HALF a board. For GPUs the ask is a board of a given width: b200-8 first,
+     h100-8 only when B200 is blocked or absent. Chip count is preserved
+     verbatim, never rescaled by the power ratio.
+
+  Ordering here expresses preference only. Whether a candidate is affordable is
+  decided later by the limit-order gate in ``_evaluate_block``, which compares
+  the pool price against ``cap_policy`` -- so "B200 if it fits, else H100"
+  falls out of preference order plus that gate, with no price logic here and no
+  cap ever raised.
+  """
+  from google3.experimental.users.qiaos.tpu_utils.preflight import topology
+  out: list[tuple[str, int]] = []
+  for arch in topology.GPU_ROUTABLE:   # ('b200', 'h100') -- biggest first
+    if chips in topology.legal_sizes_for(arch):
+      out.append((arch, chips))
   return out
 
 
@@ -350,14 +411,17 @@ def _pick_offer(offers: list[CellOffer]) -> Optional[CellOffer]:
   return usable[0]
 
 
-def rank(candidates: list[Candidate], tier: str = 'PROD') -> list[Candidate]:
+def rank(candidates: list[Candidate], tier: str = 'PROD',
+         groups_were_explicit: bool = False) -> list[Candidate]:
   """Rank candidates. Sort key, in order:
 
     1. blocked ascending   -- never put a limit-order-blocked combo on top.
     2. status  ascending   -- GREEN before YELLOW (RED never reaches here).
-    2c. group preference    -- PROD only; spend g3/g5 (own balance, exempt from
+    2c. group preference    -- PROD only, and only when the caller did NOT name
+                              the groups; spend g3/g5 (own balance, exempt from
                               the G9 income/10 cap) before g9 and the rest. See
-                              ``_GROUP_PREF``. Neutral at BATCH (free pool).
+                              ``_GROUP_PREF``. Neutral at BATCH (free pool) and
+                              under an explicit ``--groups=``.
     3. headroom descending -- see the PROD/BATCH split below.
     3b. unverified asc     -- PROD only; quota==0 sinks. See below.
     4. cost_per_hour asc   -- chips * per-chip-hour price. Prefer cheap cells:
@@ -410,6 +474,16 @@ def rank(candidates: list[Candidate], tier: str = 'PROD') -> list[Candidate]:
   magnitude, so it cannot outvote price: comparing floor SIZES happens at step
   7, after cost, so a free cell still beats a bigger-but-dearer claim.
   Both are neutral at BATCH, where holding a floor buys nothing.
+
+  Args:
+    candidates: the combos to order.
+    tier: PROD or BATCH; several steps are neutral at BATCH.
+    groups_were_explicit: True when the caller passed ``--groups=``. Turns off
+      step 2c, so an explicitly requested group is ranked on its own merits
+      instead of being pushed below g3/g5 -- see the note on ``group_pref``.
+
+  Returns:
+    The candidates, ordered best-first.
   """
   is_batch = tier.upper() == 'BATCH'
   status_rank = {preflight.Status.GREEN.value: 0,
@@ -419,21 +493,42 @@ def rank(candidates: list[Candidate], tier: str = 'PROD') -> list[Candidate]:
     headroom = c.obtainable_ratio if is_batch else c.headroom_ratio
     quota = (c.verdict.capacity.alloc_scoped_quota
              if c.verdict.capacity else 0)
+    # Ranking keeps treating an unreadable floor as unverified -- the
+    # conservative direction. Only the DISPLAY layer distinguishes "read
+    # failed" from "holds no floor"; see `capacity.quota_readable`.
     unverified = 0 if (is_batch or quota > 0) else 1
     floor_rank = 0 if is_batch else -quota
     # Whose budget to spend first. Neutral at BATCH (one free pool, nothing is
     # spent), active at PROD where g3/g5 are exempt from the G9 income/10 cap.
-    group_pref = (0 if is_batch
+    #
+    # ★Neutral ALSO when the caller named the groups (`--groups=9`): the
+    # preference answers "whose budget should we draw?", which is only a
+    # question when the router is free to choose. Applying it to an explicit
+    # single-group request cost a real run: a line pinned to g9 read a table
+    # whose every row was g3/g5, and concluded its own pool had no capacity.
+    # A preference that survives being overridden is not a preference.
+    group_pref = (0 if (is_batch or groups_were_explicit)
                   else _GROUP_PREF.get(c.group_id, _GROUP_PREF_DEFAULT))
     # Unknown price sorts after every known one, so a priced cheap cell always
     # beats an unpriced guess.
     cost = float('inf') if c.cost_per_hour is None else c.cost_per_hour
+    # ★GPU: BIGGEST CARD FIRST, AND IT MUST OUTRANK PRICE. This term sits
+    # ABOVE `cost` on purpose. Today B200 happens to clear at 0.00 and H100 at
+    # ~0.38, so cheapest-first would pick B200 by accident; the operator's rule
+    # is "use the biggest card unless its price blocks it", which must keep
+    # holding when that accident reverses. Affordability is NOT decided here --
+    # a card whose pool price exceeds its cap_policy cap is already `blocked`,
+    # and `blocked` is the first term in this tuple, so an unaffordable B200
+    # sorts below a runnable H100 without any price comparison at this level.
+    # Zero for every TPU, so TPU ordering is untouched.
+    gpu_pref = _GPU_PREF.get(c.arch, 0)
     return (
         1 if c.blocked else 0,                        # ascending: 0 = runnable
         status_rank.get(c.verdict.status.value, 99),  # ascending: 0 = GREEN
         group_pref,                                   # ascending: g3/g5 first
         -headroom,                                    # descending
         unverified,                                   # ascending: verified 1st
+        gpu_pref,                                     # ascending: b200 < h100
         cost,                                         # ascending: cheap first
         _ARCH_PREF.get(c.arch, 99),
         c.chips,
@@ -494,15 +589,42 @@ def route(power: str,
     else:
       progress_fn(f'market data UNAVAILABLE: {snapshot.warning}')
 
-  target = parse_power_input(power)
-  if progress_fn:
-    progress_fn(f"target power ~ {target} v5p-equivalent chips "
-                f"(tolerance +-{tolerance*50:.0f}%)")
+  # ★GPU FORK, TAKEN BEFORE ANY POWER ARITHMETIC. parse_power_input() would
+  # turn 'b200-8' into a v5p-equivalent float, and from that point on the
+  # request is indistinguishable from a TPU one -- which is exactly how a CUDA
+  # job ends up being offered a v5e slice. So a GPU spec never reaches the
+  # power path at all; it gets its own candidate set (biggest card first) and
+  # its own message.
+  gpu_req = parse_gpu_request(power)
+  if gpu_req is not None:
+    gpu_arch, gpu_chips = gpu_req
+    options = _gpu_candidate_options(gpu_chips)
+    if progress_fn:
+      progress_fn(f"GPU request {gpu_arch}-{gpu_chips}: GPU-only, "
+                  f"biggest card first -> {options}")
+    if not options:
+      # The asked-for width is not a legal slice on any routable card. Fall
+      # back to the card the caller named, so the answer is "here is why that
+      # shape fails" rather than a silently empty table.
+      options = [(gpu_arch, gpu_chips)]
+      if progress_fn:
+        progress_fn(f"no routable GPU has a legal {gpu_chips}-device slice; "
+                    f"reporting {gpu_arch}-{gpu_chips} as asked")
+  else:
+    target = parse_power_input(power)
+    if progress_fn:
+      progress_fn(f"target power ~ {target} v5p-equivalent chips "
+                  f"(tolerance +-{tolerance*50:.0f}%)")
 
-  options = _candidate_options(target, tolerance)
-  if progress_fn:
-    progress_fn(f"expanded to {len(options)} (arch, chips) options: {options}")
+    options = _candidate_options(target, tolerance)
+    if progress_fn:
+      progress_fn(f"expanded to {len(options)} (arch, chips) options: "
+                  f"{options}")
 
+  # Captured BEFORE the default is filled in: once `groups` is populated from
+  # GROUP_MAP the two cases are indistinguishable, and the ranking needs to
+  # know whether the caller chose or merely accepted.
+  groups_were_explicit = groups is not None
   if groups is None:
     # Every group we know about. Deriving this from GROUP_MAP rather than a
     # literal range is the whole fix for the g9 bug: the old `range(1, 9)`
@@ -593,7 +715,8 @@ def route(power: str,
           limit_order=limit_order,
           offers=tuple(offers)))
 
-  ranked = rank(candidates, tier=tier)
+  ranked = rank(candidates, tier=tier,
+                groups_were_explicit=groups_were_explicit)
   return (ranked[:top_k], snapshot)
 
 

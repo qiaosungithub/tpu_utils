@@ -24,17 +24,22 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import fcntl
+import getpass
 import json
 import os
 import re
+import shlex
 import subprocess
+import tempfile
 import time
+import uuid
 from typing import Callable, Optional, Protocol
 
 from absl import app
 from absl import flags
 
 from google3.experimental.users.qiaos.tpu_utils import avail_provider
+from google3.experimental.users.qiaos.tpu_utils import cell_locality
 from google3.experimental.users.qiaos.tpu_utils import route_lib
 
 
@@ -57,6 +62,17 @@ class _Submitter(Protocol):
   def cancel(self, xid: str) -> tuple[bool, str]:
     ...
 
+  def find_xid_by_name(self, exp_name: str,
+                       timeout_s: float = 120.0) -> tuple[Optional[str], str]:
+    """Newest XID whose experiment name matches EXACTLY, or (None, why).
+
+    Part of the protocol because adopt_escaped_builds depends on it, and on the
+    WORDING of its second element: a caller must be able to tell 'the lookup ran
+    and saw nothing' (safe to rebuild) from 'the lookup could not run' (must not
+    rebuild -- the experiment may be there and unseen).
+    """
+    ...
+
 
 # Live scheduling states for a submitted XID, collapsed to what re-route needs.
 STATUS_PENDING = 'PENDING'     # still in the auction -- the re-route trigger
@@ -64,6 +80,7 @@ STATUS_RUNNING = 'RUNNING'     # scheduled/coming up/running -- leave it alone
 STATUS_TERMINAL = 'TERMINAL'   # ended BADLY (failed/stopped/cancelled) -- zombie
 STATUS_COMPLETED = 'COMPLETED'  # ended WELL (ran to completion) -- NOT a failure
 STATUS_UNKNOWN = 'UNKNOWN'     # probe failed -- do NOT act (never cancel blind)
+STATUS_GONE = 'GONE'           # experiment resolves but has ZERO work units
 
 # NOTE: TERMINAL and COMPLETED were ONE constant until it was found that
 # reconcile wrote FAILED for every job that merely finished: 105 of 227 queue
@@ -89,6 +106,42 @@ class _OutputProbe(Protocol):
 
   def latest_mtime(self, entry: 'route_lib.QueueEntry') -> Optional[float]:
     ...
+
+
+# ★Re-route timestamps for the global brake, PERSISTED. An in-memory list would
+# be correct for one --reroute_loop process, but that process died 4 times in a
+# 90-second window earlier today; a brake whose history resets on restart is
+# exactly useless in the situation that restarts it. Small append-only JSON,
+# pruned to the window on every read.
+REROUTE_HISTORY_FILE = os.path.expanduser('~/.tpu_reroute_history.json')
+_RECENT_REROUTES: list[float] = []
+
+
+def _load_reroute_history(path: str = REROUTE_HISTORY_FILE,
+                          window_s: float = 3600.0) -> list[float]:
+  """Timestamps inside the window. A missing/corrupt file reads as EMPTY, which
+  fails OPEN (brake disengaged): losing the history must not silently suspend
+  re-routing fleet-wide."""
+  try:
+    with open(path) as f:
+      raw = json.load(f)
+    cutoff = time.time() - window_s
+    return [float(t) for t in raw if float(t) >= cutoff]
+  except (OSError, ValueError, TypeError):
+    return []
+
+
+def _save_reroute_history(times: list[float],
+                          path: str = REROUTE_HISTORY_FILE) -> None:
+  """Atomic write (tmp+rename): a torn read must never look like 'no churn'."""
+  try:
+    d = os.path.dirname(path) or '.'
+    fd, tmp = tempfile.mkstemp(dir=d, prefix='.reroute_hist.')
+    with os.fdopen(fd, 'w') as f:
+      json.dump(times[-500:], f)
+    os.replace(tmp, path)
+  except OSError:
+    pass  # history is best-effort; never break re-routing over it
 
 
 DEFAULT_QUEUE_FILE = os.path.expanduser('~/.tpu_local_queue.json')
@@ -137,8 +190,11 @@ _REROUTE_AFTER_S = flags.DEFINE_float(
     'reroute_after_s', 600.0, 'A SUBMITTED job still PENDING this many seconds '
     'after submit is cancelled and re-routed (operator default: 10 min).')
 _COOLDOWN_S = flags.DEFINE_float(
-    'cooldown_s', 1800.0, 'After a re-route, avoid the stuck cell for this long '
-    'so the job does not bounce straight back into it.')
+    'cooldown_s', 7200.0, 'After a re-route, cool the stuck cell AND the arch '
+    'for this long (operator 2026-09-10: 30min -> 2h). The old 30min window '
+    'expired before the backlogged serial build-worker re-dispatched the job, '
+    'so the penalty read as gone at the moment it should have applied. Feeds '
+    'both cooldown_cells (decaying) and cooldown_archs (flat, stacking).')
 _CONFIRM_GAP_S = flags.DEFINE_float(
     'reroute_confirm_gap_s', 15.0, 'Before cancelling a PENDING job, wait this '
     'long and re-probe; only cancel if STILL pending. Clears BATCH shadow-WU '
@@ -148,6 +204,13 @@ _FRESH_OUTPUT_S = flags.DEFINE_float(
     'this many seconds is judged ALIVE and never re-routed, whatever XManager '
     'says (disk evidence beats a PENDING snapshot). Default 20 min > a BATCH '
     'work-unit segment.')
+_NOMINAL_RUNNING_GRACE_S = flags.DEFINE_float(
+    'reroute_nominal_running_grace_s', 3600.0, 'How long a row may sit RUNNING '
+    'with NO Borg VM group in RUN and nothing ever written before it is treated '
+    'as stuck and re-routed. XManager reports RUNNING for a job whose VM groups '
+    'never left PENDING; that shape burned 12 h on one XID with zero output. '
+    'Only the full conjunction acts (Borg answered + no group RUN + nothing '
+    'written + past this grace); any doubt promotes as before.')
 # --- Step2: XM-truth reconcile + the standalone reroute-loop process --------
 _RECONCILE = flags.DEFINE_bool(
     'reconcile', False, 'Instead of placing QUEUED jobs, run ONE XM-truth '
@@ -155,6 +218,21 @@ _RECONCILE = flags.DEFINE_bool(
     'XManager and rewrite zombies (XM terminal) to FAILED, promote XM-running '
     'SUBMITTED to RUNNING. Fixes R3 (stale local state poisoning the route path). '
     'Read-only against XM; only local queue rows change. UNKNOWN never acts.')
+_AUTO_RESUME_PRUNED = flags.DEFINE_bool(
+    'auto_resume_pruned', False, 'In the reconcile pass, when a row is cleaned '
+    'up to FAILED, decide whether it was PRUNED/PREEMPTED (a healthy run killed '
+    'from outside: XM terminal + a surviving checkpoint + no code-bug signature '
+    'in the log tail + no live same-config sibling) and, if so, auto-append a '
+    'fresh QUEUED row that resumes it WARM from the last checkpoint. OFF by '
+    'default: turning it on makes reconcile SUBMIT work, so it must be an '
+    'explicit choice, and it honours --dry_run (logs the plan, appends nothing). '
+    'Every guard defaults to leaving the dead row alone; see '
+    'route_lib.plan_pruned_restart.')
+_AUTO_RESUME_MAX = flags.DEFINE_integer(
+    'auto_resume_max', 3, 'Max automatic warm-restarts of one run before the '
+    'reconcile pass stops and leaves it for a human (carried on the entry as '
+    'auto_resumes). Guards against a run that dies for a non-pruner reason the '
+    'code-bug scan missed looping on PROD budget.')
 _REROUTE_LOOP = flags.DEFINE_bool(
     'reroute_loop', False, 'Run as the STANDALONE tpu-reroute PROCESS: an own '
     'loop that each round does (A) an XM-truth reconcile pass then (B) a reroute '
@@ -312,6 +390,13 @@ def merge_and_save_touched(
         # A field the pass does not own must be carried over from the LIVE row.
         if getattr(t, 'group', None) is None and getattr(e, 'group', None):
           t.group = e.group
+        # Same reasoning for the caller's PIN, which no pass owns either: a
+        # reconcile snapshot taken before `tpu enqueue --group=` landed would
+        # otherwise write the row back unpinned, and the pin would evaporate
+        # between the moment the caller set it and the first dispatch round.
+        if (getattr(t, 'pin_group', None) is None
+            and getattr(e, 'pin_group', None)):
+          t.pin_group = e.pin_group
         merged.append(t)
       else:
         merged.append(e)
@@ -619,7 +704,16 @@ class XManagerStatusProbe:
     except Exception:  # pylint: disable=broad-except
       return STATUS_UNKNOWN
     if not wus:
-      return STATUS_UNKNOWN
+      # ★GONE, not UNKNOWN. `get_experiment` SUCCEEDED -- the id resolves -- and
+      # the experiment reports no work units at all. A live job always has at
+      # least one WU, so this is a definite verdict about the world, not a
+      # failure to read it. Returning UNKNOWN here is what deadlocked 13 rows
+      # for 5-8 days (measured 2026-08-31): reconcile's "never act on UNKNOWN"
+      # guard left them SUBMITTED forever, while `tpu dequeue` refuses any row
+      # that still carries an xid -- so nothing could ever clean them up.
+      # The distinction that makes this safe is the try/except above: a probe
+      # that cannot reach XM still returns UNKNOWN and still acts on nothing.
+      return STATUS_GONE
     # A job is "still pending" only if EVERY work unit is pending; if any WU is
     # running/coming up, the placement took.
     states = []
@@ -667,6 +761,107 @@ def _parse_fileutil_mtime(fields: list[str]) -> Optional[float]:
   return None
 
 
+class _BorgVmProbe(Protocol):
+  """Answers "is one of this job's Borg VM groups in RUN?".
+
+  Tri-state ON PURPOSE. True: a group is RUN. False: Borg answered and NONE of
+  the groups it printed is RUN. None: could not tell -- no cell pinned, the RPC
+  failed, or the output was empty. Only False is a verdict about the world;
+  None must never be actioned (AGENTS.md: an absence is the weakest reading).
+  """
+
+  def has_running_vmgroup(self,
+                          entry: 'route_lib.QueueEntry') -> Optional[bool]:
+    ...
+
+
+class BorgVmProbe:
+  """`borg findjobs` on the job's own cell, read at the VM-GROUP level.
+
+  ★THE JOB STATE IS NOT THE VM-GROUP STATE, IN BOTH DIRECTIONS. jobs.md
+  §`state: RUN` Is Not Evidence covers one of them: a Borg job reads RUN for
+  hours with every group in ASSIGN/PENDING. This class exists for the other:
+  XManager reads RUNNING for a job whose groups never left PENDING. Same fix
+  either way -- look at the groups.
+
+  An EMPTY result is None, never False. `findjobs` returns empty just as
+  readily for a wrong cell or a malformed --name_re as for a job that truly
+  does not exist, and an empty answer from a misaimed query is the classic
+  false negative. False is returned only when Borg printed at least one
+  VM-group state for this job and none of them was RUN.
+  """
+
+  _RUN_STATES = frozenset({'VMGROUP_STATE_RUN'})
+
+  def __init__(self, timeout_s: float = 45.0):
+    self._timeout_s = timeout_s
+
+  def has_running_vmgroup(self,
+                          entry: 'route_lib.QueueEntry') -> Optional[bool]:
+    xid = getattr(entry, 'xid', None)
+    cell = (getattr(entry, 'cell', None) or '').strip()
+    if not xid or not cell:
+      return None
+    try:
+      user = getpass.getuser()
+    except Exception:  # pylint: disable=broad-except
+      user = os.environ.get('USER', '')
+    if not user:
+      return None
+    try:
+      out = subprocess.run(
+          ['borg', f'--borg={cell}', 'findjobs',
+           f'--name_re={user}_group_{xid}\\..*'],
+          capture_output=True, text=True, timeout=self._timeout_s)
+    except (subprocess.TimeoutExpired, OSError):
+      return None
+    if out.returncode != 0:
+      return None
+    states = re.findall(r'VMGROUP_STATE_[A-Z_]+', out.stdout or '')
+    if not states:
+      return None  # nothing readable -- not evidence of absence
+    return any(s in self._RUN_STATES for s in states)
+
+
+# The launcher's own bucket rule, replayed (xm_launcher.py `_local_bucket` and
+# `_BUCKET_SUFFIX`): an explicit --bucket wins, otherwise the bucket is resolved
+# from the LANDING CELL through the measured locality table.
+#
+# ★A probe that reads only `launch_kwargs['bucket']` is blind to exactly the
+# jobs the guides tell you to launch. Several metros and NO --bucket is the
+# prescribed shape (jobs.md §Give The Router More Than One Way To Say Yes),
+# because a hardcoded bucket under a multi-metro list writes cross-metro and
+# gets the job pruned mid-run. Every such job returned None here, so
+# `output_is_fresh(None, ...)` was False and the disk guard degraded to "no
+# evidence" for all of them -- silently, and in the safe direction, which is why
+# it survived: a guard that can only turn re-routing OFF looks harmless when it
+# stops working. It is not harmless; it is the guard that keeps a live job from
+# being cancelled.
+_BUCKET_SUFFIX = 'home/qiaos/eqr_data'
+
+
+def _bucket_for_entry(entry: 'route_lib.QueueEntry') -> Optional[str]:
+  """Where this job WRITES, or None when that cannot be PROVEN.
+
+  Never guesses a default prefix. An unknown cell returns None ("no disk
+  evidence") rather than a plausible path, for the same reason the launcher
+  refuses to launch on one: the wrong path is a perfectly valid path.
+  """
+  explicit = (getattr(entry, 'launch_kwargs', None) or {}).get('bucket')
+  if explicit:
+    return str(explicit)
+  cell = (getattr(entry, 'cell', None) or '').strip()
+  if not cell:
+    return None
+  try:
+    return cell_locality.bucket_for(cell, _BUCKET_SUFFIX, allow_personal=False)
+  except Exception:  # pylint: disable=broad-except
+    # UnknownCellError, a metro with no group storage, or a locality table that
+    # cannot answer. All mean the same thing here: we cannot prove where this
+    # job writes, so we have no disk evidence about it.
+    return None
+
+
 class CnsOutputProbe:
   """Newest mtime of ANY file under a job's XID-prefixed output dir on CNS.
 
@@ -693,7 +888,7 @@ class CnsOutputProbe:
 
   def latest_mtime(self, entry: 'route_lib.QueueEntry') -> Optional[float]:
     xid = entry.xid
-    bucket = (entry.launch_kwargs or {}).get('bucket')
+    bucket = _bucket_for_entry(entry)
     if not xid or not bucket:
       return None
     # XID-prefixed dir: <bucket>/logs/<project>/xid_<xid>_*  (fileutil ** does
@@ -726,12 +921,183 @@ class CnsOutputProbe:
     return newest
 
 
+# --- Pruned-restart evidence: the CNS I/O that feeds plan_pruned_restart -----
+# route_lib owns the DECISION (pure, unit-tested); everything here is the I/O
+# that gathers its inputs off CNS. Every failure path returns "no evidence"
+# (None), which route_lib.plan_pruned_restart reads as a reason to HOLD -- so a
+# broken read can only make auto-resume MORE cautious, never fire it wrongly.
+
+
+def _new_resume_job_id(power: str) -> str:
+  """A fresh local job_id for a warm-restart row, same shape as queue_cli's."""
+  return f'{power}-{uuid.uuid4().hex[:6]}'
+
+
+def _find_newest_rank0_log(bucket: str, xid: str,
+                           timeout_s: float) -> Optional[str]:
+  """Path of the newest rank-0 attempt log for an XID, or None.
+
+  Logs live at `<bucket>/logs/<project>/xid_<xid>_*/logs/rank_0_attempt<N>.log`;
+  the highest attempt number is the last one the run wrote (a preemption bumps
+  the attempt), so its tail is where a crash -- if any -- would be.
+  """
+  pattern = f'{bucket.rstrip("/")}/logs/*/xid_{xid}_*/logs/rank_0_attempt*.log'
+  try:
+    out = subprocess.run(['fileutil', 'ls', pattern],
+                         capture_output=True, text=True, timeout=timeout_s)
+  except (subprocess.TimeoutExpired, OSError):
+    return None
+  if out.returncode != 0 or not out.stdout.strip():
+    return None
+  best_n, best = -1, None
+  for line in out.stdout.splitlines():
+    p = line.strip()
+    m = re.search(r'rank_0_attempt(\d+)\.log$', p)
+    if not m:
+      continue
+    n = int(m.group(1))
+    if n > best_n:
+      best_n, best = n, p
+  return best
+
+
+def _read_log_head_tail(path: str, head_bytes: int, tail_bytes: int,
+                        timeout_s: float) -> tuple[str, str]:
+  """(head, tail) byte-slices of a CNS log, capped so a multi-GB log is never
+  pulled whole. The out_dir line lives in the head (boot banner); a crash lives
+  in the tail. Any read failure yields ('', ''), i.e. no evidence.
+  """
+  q = shlex.quote(path)
+  def _slice(cmd: str) -> str:
+    try:
+      out = subprocess.run(f'fileutil cat {q} | {cmd}', shell=True,
+                           capture_output=True, text=True, timeout=timeout_s)
+    except (subprocess.TimeoutExpired, OSError):
+      return ''
+    return out.stdout or ''
+  return (_slice(f'head -c {int(head_bytes)}'),
+          _slice(f'tail -c {int(tail_bytes)}'))
+
+
+def _ls_cns(path: str, timeout_s: float) -> Optional[list[str]]:
+  """`fileutil ls <path>` -> list of entry paths, or None on any failure/empty."""
+  try:
+    out = subprocess.run(['fileutil', 'ls', path],
+                         capture_output=True, text=True, timeout=timeout_s)
+  except (subprocess.TimeoutExpired, OSError):
+    return None
+  if out.returncode != 0 or not out.stdout.strip():
+    return None
+  return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+
+
+def _latest_complete_checkpoint(out_dir: str,
+                                timeout_s: float) -> Optional[str]:
+  """Path of the highest-step COMPLETE checkpoint for `out_dir`, or None.
+
+  Scans BOTH fleet layouts, because one out_dir is one or the other and the
+  evidence layer cannot know which in advance:
+
+    * torch port: `<out_dir>/steps/step_<N>.pt` FILES. The saver writes a
+      dot-prefixed `.step_<N>.pt.tmp` and atomically `_replace`s it, so a job
+      killed mid-write leaves only the tmp -- which fails the `step_` prefix /
+      `.pt` suffix test and is never mistaken for a usable checkpoint.
+    * ELT/EqR-jax: `<out_dir>/checkpoints/<N>/` DIRS with a BARE-INTEGER leaf.
+      orbax writes `<N>.orbax-checkpoint-tmp-<uuid>` and atomically renames to
+      `<N>` on finalize, so a bare int is complete by construction and a tmp
+      leaf (non-digit) is skipped. Without this branch every ELT auto-resume
+      HOLDs for lack of a checkpoint it never scanned for (the layout the
+      pruned-restart path was blind to; the whole reason ELT could not
+      auto-resume).
+
+  The two live under different subdirs and never collide, so we take the global
+  max step across both and return that leaf path verbatim (an ELT leaf comes
+  back as `<out_dir>/checkpoints/<N>`, exactly what build_warm_restart_entry
+  inverts into restart_from+restart_step).
+  """
+  base = out_dir.rstrip('/')
+  best_step, best = -1, None
+
+  # torch: <out_dir>/steps/step_<N>.pt files
+  steps = base + '/steps'
+  for p in (_ls_cns(steps, timeout_s) or []):
+    name = p.rsplit('/', 1)[-1]
+    if not (name.startswith('step_') and name.endswith('.pt')):
+      continue
+    s = route_lib.checkpoint_step(name)
+    if s > best_step:
+      best_step = s
+      best = p if p.startswith('/cns') else f'{steps}/{name}'
+
+  # ELT/EqR-jax: <out_dir>/checkpoints/<N> dirs (bare-int leaf = complete)
+  ckpts = base + '/checkpoints'
+  for p in (_ls_cns(ckpts, timeout_s) or []):
+    name = p.rstrip('/').rsplit('/', 1)[-1]
+    s = route_lib.elt_checkpoint_leaf_step(name)
+    if s > best_step:
+      best_step = s
+      best = p.rstrip('/') if p.startswith('/cns') else f'{ckpts}/{name}'
+
+  return best
+
+
+class CnsRestartEvidence:
+  """Gathers the two CNS facts plan_pruned_restart needs about a dead row: any
+  code-bug signature in the log tail, and the newest complete checkpoint. Held
+  as an injectable object so run_reconcile stays unit-testable with a fake.
+  """
+
+  def __init__(self, timeout_s: float = 30.0,
+               head_bytes: int = 32768, tail_bytes: int = 65536):
+    self._timeout_s = timeout_s
+    self._head_bytes = head_bytes
+    self._tail_bytes = tail_bytes
+
+  def code_bug_and_checkpoint(
+      self, entry: 'route_lib.QueueEntry'
+  ) -> tuple[Optional[str], Optional[str]]:
+    bucket = _bucket_for_entry(entry)
+    if not bucket or not entry.xid:
+      return None, None
+    log_path = _find_newest_rank0_log(bucket, str(entry.xid), self._timeout_s)
+    if not log_path:
+      return None, None
+    head, tail = _read_log_head_tail(
+        log_path, self._head_bytes, self._tail_bytes, self._timeout_s)
+    code_bug = route_lib.looks_like_code_bug(tail)
+    out_dir = (route_lib.out_dir_from_log(head)
+               or route_lib.out_dir_from_log(tail))
+    checkpoint = (_latest_complete_checkpoint(out_dir, self._timeout_s)
+                  if out_dir else None)
+    return code_bug, checkpoint
+
+
+def _restart_decision(dead: 'route_lib.QueueEntry',
+                      entries: list['route_lib.QueueEntry'],
+                      evidence, max_resumes: int):
+  """(plan, checkpoint) for a just-failed row: gather CNS evidence, apply the
+  pure decision. plan is (verdict, why). Kept separate so both the dry-run and
+  the live branch of run_reconcile decide identically.
+  """
+  cb, ckpt = (evidence.code_bug_and_checkpoint(dead)
+              if evidence else (None, None))
+  other = route_lib.has_live_config_sibling(dead, entries)
+  plan = route_lib.plan_pruned_restart(
+      dead, xm_terminal=True, code_bug=cb, checkpoint=ckpt,
+      other_live_writer=other, max_auto_resumes=max_resumes)
+  return plan, ckpt
+
+
 # --- Step2: XM-truth reconcile pass (fixes R3 zombie pollution) -------------
 def run_reconcile(
     entries: list[route_lib.QueueEntry],
     now: float,
     probe: _StatusProbe,
     dry_run: bool = True,
+    *,
+    auto_resume_pruned: bool = False,
+    auto_resume_max: int = 3,
+    restart_evidence=None,
 ) -> tuple[list[route_lib.QueueEntry], list[str]]:
   """Re-verify every non-terminal (RECONCILABLE_STATES) entry against XManager
   and clean up stale local state. Returns (entries, log_lines).
@@ -753,7 +1119,7 @@ def run_reconcile(
   if not targets:
     log.append('[reconcile] no non-terminal entries to reconcile.')
     return entries, log
-  n_zombie = n_promoted = n_unknown = n_noop = n_done = 0
+  n_zombie = n_promoted = n_unknown = n_noop = n_done = n_resumed = 0
   for e in targets:
     xid = e.xid
     if not xid:
@@ -761,7 +1127,11 @@ def run_reconcile(
       continue
     st = probe.status(str(xid))
     tag = f'{e.job_id} (xid={xid}, local {e.state.value}, XM {st})'
-    new_state = route_lib.decide_reconcile(e.state, st)
+    # Age gates the GONE verdict only (a young row is legitimately 0-WU).
+    # submitted_at is None on a re-routed row, which reads as 'age unknown'
+    # and, like UNKNOWN, actions nothing.
+    age_s = (now - e.submitted_at) if e.submitted_at else None
+    new_state = route_lib.decide_reconcile(e.state, st, age_s=age_s)
     if new_state is None:
       if st == STATUS_UNKNOWN:
         n_unknown += 1
@@ -772,16 +1142,40 @@ def run_reconcile(
       log.append(f'[DRY][reconcile] would set {tag} -> {new_state.value}')
       if new_state == route_lib.JobState.FAILED:
         n_zombie += 1
+        if auto_resume_pruned:
+          (verdict, why), ckpt = _restart_decision(
+              e, entries, restart_evidence, auto_resume_max)
+          if verdict == route_lib.RESUME_WARM:
+            log.append(f'[DRY][auto-resume] {tag}: would warm-restart from '
+                       f'{ckpt} ({why})')
+          else:
+            log.append(f'[DRY][auto-resume] {tag}: HOLD ({why})')
       elif new_state == route_lib.JobState.DONE:
         n_done += 1
       else:
         n_promoted += 1
       continue
-    changed = route_lib.reconcile_entry(e, st)
+    changed = route_lib.reconcile_entry(e, st, age_s=age_s)
     if changed:
       if e.state == route_lib.JobState.FAILED:
         n_zombie += 1
-        log.append(f'[reconcile] {tag} -> FAILED (zombie cleaned up)')
+        if st == STATUS_GONE:
+          log.append(f'[reconcile] {tag} -> FAILED '
+                     f'(experiment GONE: 0 work units, age {int(age_s or 0)}s)')
+        else:
+          log.append(f'[reconcile] {tag} -> FAILED (zombie cleaned up)')
+        if auto_resume_pruned:
+          (verdict, why), ckpt = _restart_decision(
+              e, entries, restart_evidence, auto_resume_max)
+          if verdict == route_lib.RESUME_WARM and ckpt:
+            new = route_lib.build_warm_restart_entry(
+                e, ckpt, _new_resume_job_id(e.power))
+            entries.append(new)
+            n_resumed += 1
+            log.append(f'[auto-resume] {tag}: warm-restart queued as '
+                       f'{new.job_id} from {ckpt}')
+          else:
+            log.append(f'[auto-resume] {tag}: HOLD ({why})')
       elif e.state == route_lib.JobState.DONE:
         n_done += 1
         log.append(f'[reconcile] {tag} -> DONE (completed normally)')
@@ -792,7 +1186,82 @@ def run_reconcile(
       f'[reconcile] {len(targets)} checked: {n_zombie} zombie->FAILED, '
       f'{n_done} completed->DONE, '
       f'{n_promoted} promoted->RUNNING, {n_unknown} UNKNOWN (left alone), '
-      f'{n_noop} already-correct.')
+      f'{n_noop} already-correct'
+      + (f', {n_resumed} auto warm-restart(s) queued.' if auto_resume_pruned
+         else '.'))
+  return entries, log
+
+
+def adopt_escaped_builds(
+    entries: list[route_lib.QueueEntry],
+    submitter: '_Submitter',
+    dry_run: bool = True,
+) -> tuple[list[route_lib.QueueEntry], list[str]]:
+  """Resolve rows whose BUILDING claim went stale: adopt the experiment the
+  build may have left behind, or clear the flag so the row can build again.
+
+  WHY THIS EXISTS. A stale BUILDING claim has two readings, and the expensive
+  one is not the obvious one. Obvious: the worker crashed mid-build, so requeue.
+  Expensive: the build SUCCEEDED and the experiment is RUNNING, and only the
+  write-back of its xid was lost -- then requeuing puts a SECOND writer on the
+  first one's output path. Observed 2026-09-02: elt-dit-50k-fid-v3b was
+  reclaimed to QUEUED while xid 285706173 ran; it was adopted by hand.
+
+  reclaim_stale_building cannot make this call itself -- it runs inside the
+  queue flock, where a network RPC would block every reader -- so it parks the
+  row with `adopt_check_name` set and route_lib's claim selectors refuse to
+  build it. This pass, outside the lock, is what unparks it.
+
+  ★Only an EXACT name match adopts, and only a lookup that actually RAN
+  clears the flag. A lookup that timed out leaves the row parked: "I could not
+  see it" must not read as "it is not there", or the double-write we are
+  preventing comes back through the failure path.
+  """
+  log: list[str] = []
+  parked = [e for e in entries if e.adopt_check_name]
+  if not parked:
+    return entries, log
+  n_adopted = n_cleared = n_still_unknown = 0
+  for e in parked:
+    name = e.adopt_check_name
+    if not name:          # narrowed for the type checker; the filter guarantees it
+      continue
+    found, how = submitter.find_xid_by_name(name)
+    if found:
+      if dry_run:
+        log.append(f'[DRY][adopt] would adopt xid={found} for {e.job_id} '
+                   f'(exp_name={name}; {how})')
+        n_adopted += 1
+        continue
+      e.xid = found
+      e.state = route_lib.JobState.SUBMITTED   # reconcile promotes it if RUNNING
+      e.submitted_at = e.submitted_at or time.time()
+      e.adopt_check_name = None
+      e.last_reason = (f'adopted escaped build: the stale BUILDING claim had '
+                       f'already produced xid={found} ({how}); re-dispatching '
+                       f'would have double-written its output path')
+      log.append(f'[adopt] {e.job_id} -> xid={found} ({how})')
+      n_adopted += 1
+      continue
+    # No match. Distinguish "the lookup ran and saw nothing" (safe to release)
+    # from "the lookup could not run" (must stay parked).
+    ran = how.startswith('XM lookup ran')
+    if not ran:
+      n_still_unknown += 1
+      log.append(f'[adopt] {e.job_id} STAYS PARKED: {how}')
+      continue
+    if dry_run:
+      log.append(f'[DRY][adopt] would release {e.job_id} to build ({how})')
+      n_cleared += 1
+      continue
+    e.adopt_check_name = None
+    e.last_reason = (f'adopt-check clear: no XManager experiment named {name} '
+                     f'({how}), so the stale build left nothing behind; '
+                     f'releasing the row to build again')
+    log.append(f'[adopt] {e.job_id} released to build ({how})')
+    n_cleared += 1
+  log.append(f'[adopt] {len(parked)} parked row(s): {n_adopted} adopted, '
+             f'{n_cleared} released, {n_still_unknown} still unresolved.')
   return entries, log
 
 
@@ -809,6 +1278,9 @@ def run_reroute(
     confirm_gap_s: float = 15.0,
     fresh_output_s: float = 1200.0,
     sleep_fn: Callable[[float], None] = time.sleep,
+    history_file: Optional[str] = None,
+    borg_probe: Optional['_BorgVmProbe'] = None,
+    nominal_running_grace_s: float = 3600.0,
 ) -> tuple[list[route_lib.QueueEntry], list[str]]:
   """Cancel SUBMITTED jobs stuck PENDING past the deadline and return them to
   QUEUED for the next tick to re-place. Returns (entries, log_lines).
@@ -833,15 +1305,47 @@ def run_reroute(
   including the zombie TERMINAL->FAILED cleanup -- are unchanged.
   """
   log: list[str] = []
+
   candidates = [e for e in entries
                 if route_lib.needs_reroute(e, now, reroute_after_s)]
-  if not candidates:
-    log.append('[reroute] no SUBMITTED job past the pending deadline.')
+  # ★Rows already promoted to RUNNING are re-checked too, on their own longer
+  # clock. needs_reroute() selects SUBMITTED only, so without this the RUNNING
+  # branch below is reachable only on the single tick that promotes a row --
+  # and a row promoted on a stale XManager RUNNING would never be looked at
+  # again. Selection is not a verdict: the branch confirms against Borg and the
+  # disk before it touches anything, and promotes on any doubt.
+  recheck = [e for e in entries
+             if route_lib.needs_liveness_recheck(e, now,
+                                                 nominal_running_grace_s)]
+  if not candidates and not recheck:
+    log.append('[reroute] no SUBMITTED job past the pending deadline, and no '
+               'RUNNING row due a liveness re-check.')
+    return entries, log
+
+  # ★GLOBAL BRAKE. Counts what THIS process re-routed in the last hour, keyed on
+  # nothing, so it survives a churning job being dequeued and re-enqueued under
+  # a new id (measured: 7 plates across 2 rows, per-row counters saw 2).
+  # Tripping means the fault is the re-router's, and cancelling more cars cannot
+  # fix that -- so it does NOTHING and says so loudly.
+  hist = _load_reroute_history(history_file or REROUTE_HISTORY_FILE)
+  if route_lib.global_reroute_brake(hist, now):
+    n = len([t for t in hist if t >= now - 3600.0])
+    log.append(
+        f'[reroute] ★GLOBAL BRAKE ENGAGED: {n} re-routes in the last hour '
+        f'(limit {route_lib.REROUTE_GLOBAL_MAX_PER_HOUR}). Re-routing is '
+        f'SUSPENDED this pass and {len(candidates) + len(recheck)} '
+        f'candidate(s) left alone. '
+        f'A churn rate this high is a fault in placement or in the liveness '
+        f'probe, and cancelling more cars cannot fix either.')
     return entries, log
 
   sub = submitter or Submitter()
-  for e in candidates:
-    age = int(now - (e.submitted_at or now))
+  for e in candidates + [r for r in recheck if r not in candidates]:
+    # `or now` would read a submitted_at of 0.0 as "no timestamp" and report
+    # age 0 -- harmless while every real stamp is an epoch second, and wrong the
+    # moment anything (a test, a reset, a hand-edited row) carries a literal 0.
+    # The new liveness verdict below gates on this number, so say what is meant.
+    age = int(now - (e.submitted_at if e.submitted_at is not None else now))
     xid = e.xid
     state = probe.status(xid) if xid else STATUS_UNKNOWN
     tag = f'{e.job_id} (xid={xid}, {e.cell}, pending {age}s)'
@@ -879,14 +1383,72 @@ def run_reroute(
         continue
       ok, out = sub.cancel(xid)
       if ok:
+        hist.append(time.time())
+        _save_reroute_history(hist, history_file or REROUTE_HISTORY_FILE)
         route_lib.mark_reroute(e, now, cooldown_s)
         log.append(f'[reroute] cancelled + re-queued {tag}; cell cooled {int(cooldown_s)}s')
       else:
         log.append(f'[reroute] cancel FAILED for {tag}, left SUBMITTED. {_tail(out)}')
     elif state == STATUS_RUNNING:
-      e.state = route_lib.JobState.RUNNING
-      e.last_reason = f'running in {e.cell} ({e.arch}-{e.chips})'
-      log.append(f'[reroute] {tag} is RUNNING now -> promoted, no action')
+      # ★XM RUNNING IS NOT "HAS CHIPS", AND PROMOTING ON IT IS A ONE-WAY DOOR.
+      # needs_reroute() selects SUBMITTED rows only, so the moment RUNNING is
+      # written here the row leaves the re-router's jurisdiction permanently.
+      # A job whose Borg VM groups never leave PENDING reads RUNNING at the XM
+      # layer indefinitely: measured on xid 286573746, which sat 12 h in `sj`
+      # with every VM group PENDING, zero bytes in CNS and zero charged
+      # resources, while XManager, `tpu queue-status` and the queue file all
+      # said RUNNING -- and no mechanism existed that would ever move it. Its
+      # six-metro fallback list was useless because nothing consulted it.
+      # A second instance the same night (codi_unroll_loopdist_mm, xid
+      # 286454115) sat 32 h the same way, so this is the shape, not a one-off.
+      #
+      # So promote only when something INDEPENDENT of XManager agrees the job
+      # is on hardware. Any one of these promotes:
+      #   * Borg says a VM group is RUN -- the direct reading;
+      #   * the output dir has ever been written -- it got far enough to write;
+      #   * the Borg probe could not tell (None) -- an unreadable probe is not
+      #     a verdict, so FAIL OPEN to the old behaviour.
+      # Only the full conjunction withholds promotion: Borg ANSWERED, no group
+      # is RUN, nothing was ever written, and the grace period has passed. Then
+      # it is treated exactly like a stuck PENDING job -- same cancel, same
+      # mark_reroute, same global brake -- because that is what it is.
+      vm_running = borg_probe.has_running_vmgroup(e) if borg_probe else None
+      nominal = False
+      if vm_running is False and age >= nominal_running_grace_s and xid:
+        # `latest_mtime` conflates "dir missing" with "lookup failed", so this
+        # asks the weaker question it can actually answer: has ANYTHING ever
+        # been written? A job holding chips writes rank logs within minutes.
+        mtime_ever = output_probe.latest_mtime(e) if output_probe else None
+        nominal = mtime_ever is None
+      # `or not xid` is redundant against the guard above (nominal can only be
+      # True when xid is truthy) and is written anyway: it is what narrows xid
+      # from `str | None` to `str` for the cancel call below, and a reader
+      # should not have to prove that invariant from two places at once.
+      if not nominal or not xid:
+        e.state = route_lib.JobState.RUNNING
+        e.last_reason = f'running in {e.cell} ({e.arch}-{e.chips})'
+        why = ('borg vmgroup RUN' if vm_running
+               else 'borg unreadable' if vm_running is None
+               else 'output written')
+        log.append(f'[reroute] {tag} is RUNNING now -> promoted ({why}), '
+                   f'no action')
+        continue
+      if dry_run:
+        log.append(f'[DRY][reroute] would cancel + re-route {tag}: XM says '
+                   f'RUNNING but NO Borg VM group is RUN and nothing was ever '
+                   f'written ({age}s > {int(nominal_running_grace_s)}s grace)')
+        continue
+      ok, out = sub.cancel(xid)
+      if ok:
+        hist.append(time.time())
+        _save_reroute_history(hist, history_file or REROUTE_HISTORY_FILE)
+        route_lib.mark_reroute(e, now, cooldown_s)
+        log.append(f'[reroute] cancelled + re-queued {tag}: nominally RUNNING '
+                   f'(XM RUNNING, no Borg VM group in RUN, no output in '
+                   f'{age}s); cell cooled {int(cooldown_s)}s')
+      else:
+        log.append(f'[reroute] cancel FAILED for nominally-RUNNING {tag}, '
+                   f'left as-is. {_tail(out)}')
     elif state == STATUS_TERMINAL:
       e.state = route_lib.JobState.FAILED
       e.last_reason = 'terminal per XManager (failed/stopped)'
@@ -942,7 +1504,13 @@ def run_tick(
     entry = by_id.get(p.job_id)
     if entry is None:
       continue
-    workdir = entry.workdir or ''
+    # ★Package the ENQUEUE-TIME SNAPSHOT when the row has one, else the live
+    # workdir (route_lib.package_dir). The snapshot is a frozen local copy taken
+    # at `tpu enqueue`, so a build minutes-to-hours later ships the code as it
+    # was enqueued, not whatever the checkout drifted to. A row from before this
+    # field, or one enqueued --no_snapshot, has no snapshot_dir and falls back to
+    # workdir -- the pre-feature behavior, unchanged.
+    workdir = route_lib.package_dir(entry)
     cwd_note = f'  (cwd={workdir})' if workdir else '  (cwd=router process dir -- config must be via --flag)'
     if dry_run:
       argv = build_tpu_queue_cmd(p, entry, group)
@@ -954,9 +1522,21 @@ def run_tick(
     argv = build_tpu_queue_cmd(p, entry, group)
     log.append(f'[route_check] placing {p.job_id}: {p.reason}')
     log.append(f'      cmd: {" ".join(argv)}{cwd_note}')
+    t_submit = time.time()
     xid, out = sub.submit(argv, cwd=workdir)
     if xid:
-      route_lib.apply_placement(entry, p, xid=xid, now=now)
+      # ★`submitted_at` is "epoch when handed to XM", and `submit` BLOCKS for the
+      # whole build -- 890-1692 s measured in the field (host build lock, then
+      # the build). Passing the round's OPENING `now` backdated it by exactly
+      # that much, and reconcile measures its GONE grace period from it, so the
+      # grace was already spent before the experiment existed: five live cars
+      # were reconciled to FAILED at true ages of 128-938 s while still RUNNING
+      # on XM, and a FAILED row does not cancel its xid, so each kept billing
+      # invisibly. ADD THE MEASURED BLOCKING TIME to the injected `now` rather
+      # than reading the clock afresh, so a caller-supplied `now` (tests,
+      # replay) still drives the result instead of being silently ignored.
+      submitted_now = now + max(0.0, time.time() - t_submit)
+      route_lib.apply_placement(entry, p, xid=xid, now=submitted_now)
       log.append(f'      -> SUBMITTED xid={xid} cell={p.cell}')
     else:
       entry.attempts += 1
@@ -1105,12 +1685,15 @@ def run_worker_once(
 
   log.append(f'[worker] claimed {claimed.job_id} (BUILDING); planning + building.')
 
-  # WORKDIR GUARD: a set-but-nonexistent workdir would package the wrong source
-  # (or fail). Do NOT churn on it -- park it in HELD for a human to re-enqueue.
-  # An EMPTY workdir is allowed here (it may be a flag-only run); if it turns out
-  # to be unbuildable it is caught by the max-attempts HOLD below, not guessed at.
-  if claimed.workdir and not os.path.isdir(claimed.workdir):
-    reason = f'workdir does not exist: {claimed.workdir} -- re-enqueue from a valid checkout'
+  # WORKDIR GUARD: a set-but-nonexistent package dir would package the wrong
+  # source (or fail). Do NOT churn on it -- park it in HELD for a human to
+  # re-enqueue. Check the ACTUAL dir that will be packaged: the enqueue-time
+  # snapshot if the row has one, else the live workdir (route_lib.package_dir).
+  # This also catches a snapshot reclaimed out from under a row. An EMPTY dir is
+  # allowed (a flag-only run); an unbuildable one is caught by max-attempts HOLD.
+  pkg_dir = route_lib.package_dir(claimed)
+  if pkg_dir and not os.path.isdir(pkg_dir):
+    reason = f'package dir does not exist: {pkg_dir} -- re-enqueue from a valid checkout'
     def _hold_bad_workdir(e: route_lib.QueueEntry) -> None:
       route_lib.hold_entry(e, reason)
     update_entry(queue_file, claimed.job_id, _hold_bad_workdir)
@@ -1135,14 +1718,28 @@ def run_worker_once(
   # ★Prefer the group the ROUTER admitted this job under (g5/g3 before g9).
   # Falling back to the worker's global --group here is what made the whole
   # preference a no-op before: dispatch chose g5, the builder submitted g9.
-  argv = build_tpu_queue_cmd(placement, claimed, getattr(claimed, 'group', None) or group)
+  # ★A caller PIN outranks both: dispatch already resolves to it, but a row
+  # claimed without a dispatch round (the legacy `--worker` claim_pick, or a
+  # row hand-moved to BUILD_REQUESTED) would otherwise lose the pin here --
+  # exactly the "two leaders" shape that made the g5 preference a no-op.
+  argv = build_tpu_queue_cmd(
+      placement, claimed,
+      route_lib.pinned_group(claimed) or getattr(claimed, 'group', None)
+      or group)
   log.append(f'[worker] building {claimed.job_id}: {placement.reason} '
-             f'(cwd={claimed.workdir or "router dir"})')
-  xid, out = submitter.submit(argv, cwd=claimed.workdir or '')
+             f'(cwd={pkg_dir or "router dir"})')
+  t_submit = time.time()
+  xid, out = submitter.submit(argv, cwd=pkg_dir)
 
   if xid:
+    # ★See the same fix in run_tick: `submit` blocks for the whole build, so the
+    # round's opening `now` backdates submitted_at by the build duration and
+    # burns reconcile's GONE grace before the experiment exists. This is the
+    # path that submitted all five cars measured as wrongly reconciled.
+    submitted_now = now + max(0.0, time.time() - t_submit)
+
     def _submitted(e: route_lib.QueueEntry) -> None:
-      route_lib.apply_placement(e, placement, xid=xid, now=now)
+      route_lib.apply_placement(e, placement, xid=xid, now=submitted_now)
       e.build_started_at = None
       e.worker_id = None
     update_entry(queue_file, claimed.job_id, _submitted)
@@ -1319,7 +1916,19 @@ def run_dispatch_once(
     Returns (group, probe). Falls back to the LAST group in the order (the g9
     floor) when none fits, so the job is budget-deferred against g9 exactly as
     before -- the preference can only move a job to a cheaper pool, never make
-    a previously-placeable job unplaceable."""
+    a previously-placeable job unplaceable.
+
+    ★A CALLER PIN OVERRIDES THE ORDER ENTIRELY (and is still budget-probed, so
+    a pinned-to-g9 job that exceeds the income/10 bar is deferred exactly like
+    any other g9 job -- a pin buys a POOL, never a bypass of the bar). The
+    preference order is a fleet-wide default; it is right for a job that has no
+    opinion and wrong for one that keeps being preempted out of g5's
+    vqfree-xm. Without this branch there was no way to express the exception:
+    every route into the row (`--group=`, `--launch=group=`) was either eaten
+    by absl or dropped at build time."""
+    pin = route_lib.pinned_group(e)
+    if pin:
+      return pin, (_probe_group(e, pin) or {})
     last = (group_order[-1], {})
     for g in group_order:
       pr = _probe_group(e, g)
@@ -1340,7 +1949,11 @@ def run_dispatch_once(
   chosen: dict = {e.job_id: _pick_group(e)[0] for e in queued}
   for e in queued:
     g = chosen.get(e.job_id)
-    if g and g != group_order[-1]:
+    pin = route_lib.pinned_group(e)
+    if pin:
+      log.append(f'[dispatch] {e.job_id} -> group g{g} (PINNED by caller; '
+                 f'preference order {",".join(group_order)} not consulted)')
+    elif g and g != group_order[-1]:
       log.append(f'[dispatch] {e.job_id} -> group g{g} (exempt from the g9 '
                  f'income/10 bar)')
 
@@ -1523,12 +2136,32 @@ def main(argv):
     print(f'[reroute-loop] standalone reconcile+reroute on {_QUEUE_FILE.value}; '
           f'poll {_REROUTE_LOOP_POLL_S.value}s.', flush=True)
     while True:
+      # (A0) adopt-check pass. Rows whose BUILDING claim went stale are parked
+      # (route_lib.reclaim_stale_building sets adopt_check_name, and the claim
+      # selectors refuse to build them) until we know whether that build had
+      # already escaped to XManager. This runs FIRST so a row carrying a live
+      # xid is reconciled in the same round rather than sitting parked for one.
+      try:
+        snap = load_queue(_QUEUE_FILE.value)
+        ad_entries, ad_log = adopt_escaped_builds(
+            snap, submitter=Submitter(), dry_run=_DRY_RUN.value)
+        for line in ad_log:
+          print(f'  [reroute-loop:adopt] {line}', flush=True)
+        if ad_log and not _DRY_RUN.value:
+          merge_and_save_touched(_QUEUE_FILE.value, ad_entries)
+      except Exception as e:  # pylint: disable=broad-except
+        print(f'  [reroute-loop:adopt] pass FAILED (non-fatal): {e}',
+              flush=True)
       # (A) reconcile pass
       try:
         snap = load_queue(_QUEUE_FILE.value)
         rc_entries, rc_log = run_reconcile(
             snap, now=time.time(), probe=XManagerStatusProbe(),
-            dry_run=_DRY_RUN.value)
+            dry_run=_DRY_RUN.value,
+            auto_resume_pruned=_AUTO_RESUME_PRUNED.value,
+            auto_resume_max=_AUTO_RESUME_MAX.value,
+            restart_evidence=(CnsRestartEvidence()
+                              if _AUTO_RESUME_PRUNED.value else None))
         for line in rc_log:
           print(f'  [reroute-loop:reconcile] {line}', flush=True)
         if not _DRY_RUN.value:
@@ -1544,7 +2177,9 @@ def main(argv):
             reroute_after_s=_REROUTE_AFTER_S.value, cooldown_s=_COOLDOWN_S.value,
             dry_run=_DRY_RUN.value, output_probe=CnsOutputProbe(),
             confirm_gap_s=_CONFIRM_GAP_S.value,
-            fresh_output_s=_FRESH_OUTPUT_S.value)
+            fresh_output_s=_FRESH_OUTPUT_S.value,
+            borg_probe=BorgVmProbe(),
+            nominal_running_grace_s=_NOMINAL_RUNNING_GRACE_S.value)
         for line in rr_log:
           print(f'  [reroute-loop:reroute] {line}', flush=True)
         if not _DRY_RUN.value:
@@ -1567,7 +2202,11 @@ def main(argv):
     # One-shot XM-truth reconcile pass (Step2). Clean zombies off the route path.
     updated, log = run_reconcile(
         entries, now=time.time(), probe=XManagerStatusProbe(),
-        dry_run=_DRY_RUN.value)
+        dry_run=_DRY_RUN.value,
+        auto_resume_pruned=_AUTO_RESUME_PRUNED.value,
+        auto_resume_max=_AUTO_RESUME_MAX.value,
+        restart_evidence=(CnsRestartEvidence()
+                          if _AUTO_RESUME_PRUNED.value else None))
   elif _REROUTE.value:
     # Sweep SUBMITTED jobs stuck PENDING; cancel + return to QUEUED.
     updated, log = run_reroute(
@@ -1575,7 +2214,9 @@ def main(argv):
         reroute_after_s=_REROUTE_AFTER_S.value, cooldown_s=_COOLDOWN_S.value,
         dry_run=_DRY_RUN.value, output_probe=CnsOutputProbe(),
         confirm_gap_s=_CONFIRM_GAP_S.value,
-        fresh_output_s=_FRESH_OUTPUT_S.value)
+        fresh_output_s=_FRESH_OUTPUT_S.value,
+        borg_probe=BorgVmProbe(),
+        nominal_running_grace_s=_NOMINAL_RUNNING_GRACE_S.value)
   else:
     # Drain QUEUED jobs into the XM queue, trying groups IN PREFERENCE ORDER.
     # `--group_order=5,9` places what the free vqfree pool (g5) can take first

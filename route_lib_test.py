@@ -89,14 +89,38 @@ class PlacementTest(unittest.TestCase):
     p = _ok(R.plan_one(e, avail, now=0.0))
     self.assertEqual(p.cell, 'yucbfiv')
 
-  def test_rank_prefers_more_slices_then_cheaper(self):
+  def test_rank_trades_slices_against_price(self):
+    """Capacity and price are weighed together; capacity does not simply win.
+
+    ★This asserted "slices dominate price" until 2026-09-01, encoding the old
+    lexicographic sort (-n_slices, price, -free_chips). Under that order price
+    was never reached in practice, because per-cell prices all collapsed to one
+    global value -- so the router would pay 2.5x to fit one more slice. cell_score
+    divides price by a BOUNDED slice_weight, so a 2.5x price gap outweighs the
+    capacity bonus. The negative control below keeps 'cheapest always wins' from
+    passing as well.
+    """
     e = _entry()
     avail = {
-        'few': _avail('few', 'v7', free=64, price=10.0),     # 2 slices, cheap
-        'many': _avail('many', 'v7', free=3200, price=25.0),  # 100 slices
+        'few': _avail('few', 'v7', free=64, price=10.0),      # 2 slices, cheap
+        'many': _avail('many', 'v7', free=3200, price=25.0),  # 100 slices, 2.5x
     }
     p = _ok(R.plan_one(e, avail, now=0.0))
-    self.assertEqual(p.cell, 'many')     # slices dominate price
+    self.assertEqual(p.cell, 'few')      # 2.5x price beats the capped bonus
+
+  def test_rank_prefers_capacity_when_price_is_close(self):
+    """Negative control: with prices near-equal, the roomier cell must win.
+
+    Without this, the test above would also pass if slice_weight were ignored
+    entirely and the router had silently become 'always pick the cheapest'.
+    """
+    e = _entry()
+    avail = {
+        'few': _avail('few', 'v7', free=64, price=10.0),
+        'many': _avail('many', 'v7', free=3200, price=10.5),  # 5% dearer
+    }
+    p = _ok(R.plan_one(e, avail, now=0.0))
+    self.assertEqual(p.cell, 'many')
 
   def test_tpu_type_fallback_when_first_arch_unavailable(self):
     # v7 allowed first but no v7 anywhere; v6p available -> falls back.
@@ -106,16 +130,42 @@ class PlacementTest(unittest.TestCase):
     self.assertEqual(p.arch, 'v6p')
     self.assertEqual(p.chips, 32)
 
-  def test_cooldown_cell_skipped(self):
+  def test_cooldown_cell_downweighted_not_excluded(self):
+    """A cooling cell is penalised, not removed from the candidate set.
+
+    ★This test asserted the opposite until 2026-09-01: that a cell on cooldown
+    is SKIPPED. That hard exclusion was the bug -- a mechanism whose whole job
+    is "every 10 minutes, pick the best cell again" deleted the cell it had
+    just used, and returned None when every candidate was cooling, so nothing
+    could be placed at all. The replacement multiplies cell_score by
+    cooldown_penalty(), which decays to 1.0 across the window.
+    Consequence, asserted here: a much better cell still wins WHILE cooling.
+    """
     e = _entry()
     e.cooldown_cells = {'hot': 100.0}
     avail = {
         'hot': _avail('hot', 'v7', free=3200),
         'cool': _avail('cool', 'v7', free=64),
     }
-    self.assertEqual(_ok(R.plan_one(e, avail, now=50.0)).cell, 'cool')  # hot on cooldown
-    # after cooldown expires, hot (more slices) wins
+    # 50x the capacity beats a penalty bounded by COOLDOWN_WEIGHT.
+    self.assertEqual(_ok(R.plan_one(e, avail, now=50.0)).cell, 'hot')
+    # ...and it still wins once the cooldown has expired.
     self.assertEqual(_ok(R.plan_one(e, avail, now=150.0)).cell, 'hot')
+
+  def test_cooldown_penalty_flips_a_close_call(self):
+    """The penalty must actually change an outcome, or it is decoration.
+
+    Negative control for the test above: with two cells of EQUAL standing, the
+    one on cooldown must lose. Without this, 'downweighted' could mean 'weight
+    ignored' and both tests would still pass.
+    """
+    e = _entry()
+    e.cooldown_cells = {'hot': 100.0}
+    avail = {
+        'hot': _avail('hot', 'v7', free=64),
+        'cool': _avail('cool', 'v7', free=64),
+    }
+    self.assertEqual(_ok(R.plan_one(e, avail, now=50.0)).cell, 'cool')
 
 
 class BatchSchedulingTest(unittest.TestCase):
@@ -233,6 +283,50 @@ class RerouteTest(unittest.TestCase):
     p = _ok(R.plan_one(e, avail, now=800.0))
     self.assertEqual(p.cell, 'yukulwh')      # avoided the cooled-down cell
 
+  def test_reroute_falls_through_to_next_arch_when_top_arch_cell_cooling(self):
+    """The b200->b200 loop (parcae, 2026-09-09).
+
+    A multi-arch GPU job (power h100-8, archs=[h100,b200]) whose TOP-preferred
+    arch (b200, biggest-card-first) has exactly ONE usable cell in the allowed
+    metros. It gets stuck there, re-routes -> that cell is cooled. But cooldown
+    is a soft cell_score penalty, not a gate, and with only one b200 cell there
+    is nothing to reorder, so plan_one used to hand the job straight back to the
+    same cell every pass -- never trying h100, which had free capacity in a
+    DIFFERENT cell. The fix: a shape that resolves only to a still-cooling cell
+    is a fallback; keep scanning later archs first.
+    """
+    e = _entry(power='h100-8', archs=('h100', 'b200'))
+    e.state = R.JobState.SUBMITTED
+    e.cell = 'sj'
+    e.submitted_at = 0.0
+    R.mark_reroute(e, now=700.0, cooldown_s=1800.0)   # cools sj
+    # Prices under each family's limit-order cap (h100<=10, b200<=20) so the
+    # price-cap gate is not what decides this test -- the cooldown fallthrough is.
+    avail = {
+        'sj': _avail('sj', 'b200', free=1024, price=8.0),  # only b200 cell, cooling
+        'sh': _avail('sh', 'h100', free=1024, price=8.0),  # h100 free elsewhere
+    }
+    p = _ok(R.plan_one(e, avail, now=800.0))
+    self.assertEqual(p.arch, 'h100')     # fell through to the next arch
+    self.assertEqual(p.cell, 'sh')       # NOT back to the cooled b200 cell
+
+  def test_reroute_uses_cooled_fallback_when_every_arch_is_cooling(self):
+    """Negative control: if EVERY arch resolves only to a cooling cell, the job
+    still gets placed (going back is no worse than the pre-fix behaviour), not
+    left unplaced."""
+    e = _entry(power='h100-8', archs=('h100', 'b200'))
+    e.state = R.JobState.SUBMITTED
+    e.cell = 'sj'
+    e.submitted_at = 0.0
+    R.mark_reroute(e, now=700.0, cooldown_s=1800.0)   # cools sj
+    e.cooldown_cells['sh'] = 2500.0                    # sh also cooling
+    avail = {
+        'sj': _avail('sj', 'b200', free=1024, price=8.0),
+        'sh': _avail('sh', 'h100', free=1024, price=8.0),
+    }
+    p = _ok(R.plan_one(e, avail, now=800.0))
+    # b200 is the top arch, so its cooled cell is the first fallback recorded.
+    self.assertEqual(p.cell, 'sj')
   # --- hardening pure logic (2026-08-24) ---
   def test_output_is_fresh_within_window(self):
     self.assertTrue(R.output_is_fresh(latest_mtime=640.0, now=700.0,
@@ -389,12 +483,21 @@ class TopologyLockTest(unittest.TestCase):
 class TypeSelectionWeightTest(unittest.TestCase):
 
   def test_pool_weight_bounds(self):
+    # ★Derive the ceiling from the constant instead of hardcoding it. This test
+    # asserted a literal 1.20 and went red the moment POOL_BONUS was retuned
+    # 0.20 -> 0.50, which reads as a regression in the code when it is only the
+    # test restating an old value. A bound test should assert the SHAPE (0 pool
+    # earns nothing, a full pool earns exactly the bonus, partial is strictly
+    # between) so retuning the knob does not manufacture a false failure.
+    ceiling = 1.0 + R.POOL_BONUS
     self.assertEqual(R.pool_weight(0), 1.0)
-    self.assertAlmostEqual(R.pool_weight(4096), 1.20, places=2)
-    self.assertGreater(R.pool_weight(4096 * 10), 1.20 - 1e-9)
+    self.assertAlmostEqual(R.pool_weight(R.POOL_FULL_BONUS_CHIPS), ceiling,
+                           places=2)
+    self.assertGreater(R.pool_weight(R.POOL_FULL_BONUS_CHIPS * 10),
+                       ceiling - 1e-9)
     mid = R.pool_weight(64)
     self.assertGreater(mid, 1.0)
-    self.assertLess(mid, 1.20)
+    self.assertLess(mid, ceiling)
 
   def test_effective_price_big_pool_reads_cheaper(self):
     # big pool (full 20% bonus) at 24 vs thin pool at 23: 24/1.2=20.0 beats
@@ -403,10 +506,21 @@ class TypeSelectionWeightTest(unittest.TestCase):
     thin = R.effective_price(23.0, 10)
     self.assertLess(big, thin)
 
-  def test_effective_price_respects_20pct_ceiling(self):
-    big = R.effective_price(30.0, 1e9)
-    cheap = R.effective_price(24.0, 0)
-    self.assertLess(cheap, big)
+  def test_effective_price_respects_pool_bonus_ceiling(self):
+    """The pool bonus is capped: a big pool cannot forgive an arbitrary price.
+
+    ★Derived from POOL_BONUS rather than hardcoded. The old version compared
+    30.0 against a literal 24.0 chosen for POOL_BONUS=0.20; at 0.50 the bonus
+    legitimately covers that gap, so the test failed while the ceiling it meant
+    to check was working. Pick the probe price from the constant instead: just
+    above the ceiling must stay more expensive, just below must come out cheaper.
+    """
+    ceiling = 1.0 + R.POOL_BONUS
+    big = R.effective_price(30.0, 1e9)          # 30 / ceiling
+    just_over = 30.0 / ceiling * 1.05
+    just_under = 30.0 / ceiling * 0.95
+    self.assertLess(R.effective_price(just_under, 0), big)
+    self.assertGreater(R.effective_price(just_over, 0), big)
 
   def test_candidate_shapes_effective_price_ordering(self):
     e = _entry(power='v6p-32', archs=('v7', 'v6p'))
@@ -750,6 +864,265 @@ class PlanDispatchTest(unittest.TestCase):
     out = self._plan(es, 50.0, {'a': 50.0})
     self.assertEqual(out[0].decision, R.JobState.BUILD_REQUESTED)  # <= is inclusive
     self.assertAlmostEqual(out[0].headroom_after, 0.0)
+
+
+class CheckpointStepTest(unittest.TestCase):
+  """checkpoint_step parses all four fleet checkpoint spellings, -1 otherwise."""
+
+  def test_torch_file(self):
+    self.assertEqual(
+        R.checkpoint_step('/cns/si-d/x/steps/step_1024.pt'), 1024)
+
+  def test_jax_dir_trailing_slash(self):
+    self.assertEqual(R.checkpoint_step('/cns/x/step_6144/'), 6144)
+
+  def test_flat_dir_no_slash(self):
+    self.assertEqual(R.checkpoint_step('/cns/x/step_500'), 500)
+
+  def test_paligemma_checkpoint_prefix(self):
+    self.assertEqual(R.checkpoint_step('/cns/x/checkpoint_20000'), 20000)
+
+  def test_suffixed_name_still_parses(self):
+    # a `_state` / `_best` suffix must not defeat the parse
+    self.assertEqual(R.checkpoint_step('/cns/x/step_1024_best.pt'), 1024)
+
+  # -- negative controls: anything unrecognised is -1, never 0 --
+  def test_none_is_minus_one(self):
+    self.assertEqual(R.checkpoint_step(None), -1)
+
+  def test_empty_is_minus_one(self):
+    self.assertEqual(R.checkpoint_step(''), -1)
+
+  def test_non_checkpoint_name_is_minus_one(self):
+    self.assertEqual(R.checkpoint_step('/cns/x/best/'), -1)
+    self.assertEqual(R.checkpoint_step('/cns/x/latest.pt'), -1)
+
+  def test_zero_step_is_zero_not_minus_one(self):
+    # a genuine step_0 is a real (if useless) parse; distinct from unparseable
+    self.assertEqual(R.checkpoint_step('/cns/x/step_0.pt'), 0)
+
+
+class PlanPrunedRestartTest(unittest.TestCase):
+  """The checkpoint-as-evidence path. Every guard must default to HOLD; only a
+  healthy run killed from outside, with a surviving checkpoint, resumes warm."""
+
+  def _e(self, **kw):
+    return _entry(**kw)
+
+  def test_pruned_healthy_run_resumes_warm(self):
+    # the dw case: terminal, no code bug, checkpoint survived, sole writer
+    verdict, why = R.plan_pruned_restart(
+        self._e(), xm_terminal=True, code_bug=None,
+        checkpoint='/cns/x/steps/step_1024.pt', other_live_writer=False)
+    self.assertEqual(verdict, R.RESUME_WARM)
+    self.assertIn('step 1024', why)
+
+  def test_not_terminal_holds(self):
+    verdict, _ = R.plan_pruned_restart(
+        self._e(), xm_terminal=False, code_bug=None,
+        checkpoint='/cns/x/steps/step_1024.pt', other_live_writer=False)
+    self.assertEqual(verdict, R.HOLD)
+
+  def test_code_bug_holds_even_with_checkpoint(self):
+    # NEGATIVE CONTROL: a segfault must NOT auto-resume, or we replay the bug
+    verdict, why = R.plan_pruned_restart(
+        self._e(), xm_terminal=True,
+        code_bug='CODE BUG: segfault (SIGSEGV)',
+        checkpoint='/cns/x/steps/step_1024.pt', other_live_writer=False)
+    self.assertEqual(verdict, R.HOLD)
+    self.assertIn('code bug', why)
+
+  def test_no_checkpoint_holds(self):
+    # NEGATIVE CONTROL: no checkpoint -> a warm restart is a cold start
+    verdict, why = R.plan_pruned_restart(
+        self._e(), xm_terminal=True, code_bug=None,
+        checkpoint=None, other_live_writer=False)
+    self.assertEqual(verdict, R.HOLD)
+    self.assertIn('cold start', why)
+
+  def test_other_live_writer_holds(self):
+    # NEGATIVE CONTROL: the 2026-09-10 double-write -- never add a 2nd writer
+    verdict, why = R.plan_pruned_restart(
+        self._e(), xm_terminal=True, code_bug=None,
+        checkpoint='/cns/x/steps/step_1024.pt', other_live_writer=True)
+    self.assertEqual(verdict, R.HOLD)
+    self.assertIn('SECOND writer', why)
+
+  def test_budget_spent_holds(self):
+    # NEGATIVE CONTROL: after N auto-resumes, stop and let a human look
+    verdict, why = R.plan_pruned_restart(
+        self._e(auto_resumes=3), xm_terminal=True, code_bug=None,
+        checkpoint='/cns/x/steps/step_1024.pt', other_live_writer=False,
+        max_auto_resumes=3)
+    self.assertEqual(verdict, R.HOLD)
+    self.assertIn('budget', why)
+
+  def test_budget_one_below_cap_still_resumes(self):
+    verdict, _ = R.plan_pruned_restart(
+        self._e(auto_resumes=2), xm_terminal=True, code_bug=None,
+        checkpoint='/cns/x/steps/step_1024.pt', other_live_writer=False,
+        max_auto_resumes=3)
+    self.assertEqual(verdict, R.RESUME_WARM)
+
+
+class LooksLikeCodeBugTest(unittest.TestCase):
+  """The code-bug gate: crashes in the TAIL flag, a healthy pruned tail does not,
+  and the benign boot-banner ModuleNotFoundError must NOT be read as a bug."""
+
+  def test_segfault_flags(self):
+    self.assertIsNotNone(R.looks_like_code_bug('... Killed by signal 11!'))
+
+  def test_traceback_flags(self):
+    tail = 'Traceback (most recent call last):\n  File x\nValueError: bad'
+    self.assertIsNotNone(R.looks_like_code_bug(tail))
+
+  def test_oom_flags(self):
+    self.assertIsNotNone(R.looks_like_code_bug('RESOURCE_EXHAUSTED: OOM when...'))
+
+  def test_healthy_training_tail_is_none(self):
+    tail = ('[parcae-torch] step 1759 loss 3.49 gnorm 0.51 272.4k tok/s\n'
+            '[parcae-torch] step 1760 loss 3.50')
+    self.assertIsNone(R.looks_like_code_bug(tail))
+
+  def test_benign_modulenotfound_boot_note_is_none(self):
+    # NEGATIVE CONTROL: the dw boot banner prints this harmless readback note;
+    # it must NOT be classed as a code bug (that would HOLD every pruned run).
+    note = ("[parcae-torch] minloglevel READ-BACK unavailable "
+            "(ModuleNotFoundError: No module named 'base'); dep cpp_flag")
+    self.assertIsNone(R.looks_like_code_bug(note))
+
+  def test_empty_is_none(self):
+    self.assertIsNone(R.looks_like_code_bug(''))
+
+
+class OutDirFromLogTest(unittest.TestCase):
+
+  def test_post_locality_line_wins(self):
+    log = ("[parcae-torch] locality: out_dir /cns/is-d/x -> /cns/si-d/x\n"
+           "[parcae-torch] out_dir (post-locality) = '/cns/si-d/home/q/run'\n"
+           "[parcae-torch] step 1")
+    self.assertEqual(R.out_dir_from_log(log), '/cns/si-d/home/q/run')
+
+  def test_checkpoint_saved_fallback(self):
+    log = '[parcae-torch] step 1024 checkpoint saved -> /cns/si-d/home/q/run/steps/step_1024.pt'
+    self.assertEqual(R.out_dir_from_log(log), '/cns/si-d/home/q/run')
+
+  def test_none_when_no_path(self):
+    self.assertIsNone(R.out_dir_from_log('[parcae-torch] step 1 loss 10.6'))
+    self.assertIsNone(R.out_dir_from_log(''))
+
+
+class LiveConfigSiblingTest(unittest.TestCase):
+
+  def _c(self, jid, cfg, state):
+    return _entry(job_id=jid, launch_kwargs={'config': cfg}, state=state)
+
+  def test_same_config_live_is_sibling(self):
+    dead = self._c('a', 'cfgX', R.JobState.FAILED)
+    live = self._c('b', 'cfgX', R.JobState.RUNNING)
+    self.assertTrue(R.has_live_config_sibling(dead, [dead, live]))
+
+  def test_same_config_but_dead_is_not_sibling(self):
+    dead = self._c('a', 'cfgX', R.JobState.FAILED)
+    other_dead = self._c('b', 'cfgX', R.JobState.DONE)
+    self.assertFalse(R.has_live_config_sibling(dead, [dead, other_dead]))
+
+  def test_different_config_is_not_sibling(self):
+    dead = self._c('a', 'cfgX', R.JobState.FAILED)
+    live = self._c('b', 'cfgY', R.JobState.RUNNING)
+    self.assertFalse(R.has_live_config_sibling(dead, [dead, live]))
+
+  def test_entry_does_not_count_itself(self):
+    dead = self._c('a', 'cfgX', R.JobState.RUNNING)  # even if it were live
+    self.assertFalse(R.has_live_config_sibling(dead, [dead]))
+
+  def test_no_config_is_never_sibling(self):
+    dead = _entry(job_id='a', launch_kwargs={}, state=R.JobState.FAILED)
+    live = self._c('b', 'cfgX', R.JobState.RUNNING)
+    self.assertFalse(R.has_live_config_sibling(dead, [dead, live]))
+
+
+class BuildWarmRestartEntryTest(unittest.TestCase):
+
+  def _dead(self, **kw):
+    base = dict(
+        job_id='h100-8-dead', power='h100-8', archs=('h100',),
+        tier='PROD', allowed_metros=['sin', 'cbf'], state=R.JobState.FAILED,
+        xid='288098495', auto_resumes=0,
+        launch_kwargs={'config': 'cfgX', 'exp_name': 'parcae-dw', 'group': '9'})
+    base.update(kw)
+    return _entry(**base)
+
+  def test_clones_spec_and_sets_load_from(self):
+    e = R.build_warm_restart_entry(
+        self._dead(), '/cns/si-d/x/steps/step_1024.pt', 'h100-8-new01')
+    self.assertEqual(e.job_id, 'h100-8-new01')
+    self.assertEqual(e.power, 'h100-8')
+    self.assertEqual(e.allowed_archs, ['h100'])
+    self.assertEqual(e.tier, 'PROD')
+    self.assertEqual(e.allowed_metros, ['sin', 'cbf'])
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual(e.launch_kwargs['load_from'],
+                     '/cns/si-d/x/steps/step_1024.pt')
+    self.assertEqual(e.launch_kwargs['config'], 'cfgX')  # same run
+
+  def test_increments_auto_resumes_and_names_attempt(self):
+    e = R.build_warm_restart_entry(
+        self._dead(auto_resumes=1), '/cns/x/steps/step_1024.pt', 'j2')
+    self.assertEqual(e.auto_resumes, 2)
+    self.assertEqual(e.launch_kwargs['exp_name'], 'parcae-dw-r2')
+
+  def test_suffix_does_not_stack(self):
+    dead = self._dead(auto_resumes=2,
+                      launch_kwargs={'config': 'cfgX', 'exp_name': 'parcae-dw-r2'})
+    e = R.build_warm_restart_entry(dead, '/cns/x/steps/step_1024.pt', 'j3')
+    self.assertEqual(e.launch_kwargs['exp_name'], 'parcae-dw-r3')
+
+  def test_records_prior_xid(self):
+    e = R.build_warm_restart_entry(
+        self._dead(), '/cns/x/steps/step_1024.pt', 'j2')
+    self.assertIn('288098495', e.prior_xids)
+
+  def test_does_not_mutate_dead_entry(self):
+    dead = self._dead()
+    R.build_warm_restart_entry(dead, '/cns/x/steps/step_1024.pt', 'j2')
+    self.assertEqual(dead.auto_resumes, 0)
+    self.assertNotIn('load_from', dead.launch_kwargs)
+
+
+class PackageDirTest(unittest.TestCase):
+  """package_dir picks the enqueue snapshot over the live workdir, else falls
+  back to workdir, else ''."""
+
+  def test_snapshot_wins_over_workdir(self):
+    e = _entry(workdir='/live/checkout', snapshot_dir='/snap/j1')
+    self.assertEqual(R.package_dir(e), '/snap/j1')
+
+  def test_falls_back_to_workdir_when_no_snapshot(self):
+    e = _entry(workdir='/live/checkout')
+    self.assertEqual(R.package_dir(e), '/live/checkout')
+
+  def test_empty_when_both_absent(self):
+    e = _entry()
+    self.assertEqual(R.package_dir(e), '')
+
+  def test_whitespace_is_not_a_path(self):
+    e = _entry(workdir='   ', snapshot_dir='   ')
+    self.assertEqual(R.package_dir(e), '')
+
+  def test_old_row_without_field_defaults_empty_and_uses_workdir(self):
+    # An entry deserialized from a pre-feature queue file has no snapshot_dir
+    # key; from_dict defaults it to '' and package_dir must use workdir.
+    d = _entry(workdir='/live/checkout').to_dict()
+    d.pop('snapshot_dir', None)
+    e = R.QueueEntry.from_dict(d)
+    self.assertEqual(e.snapshot_dir, '')
+    self.assertEqual(R.package_dir(e), '/live/checkout')
+
+  def test_serde_round_trips_snapshot_dir(self):
+    e = _entry(workdir='/w', snapshot_dir='/snap/j1')
+    e2 = R.QueueEntry.from_dict(e.to_dict())
+    self.assertEqual(e2.snapshot_dir, '/snap/j1')
 
 
 if __name__ == '__main__':

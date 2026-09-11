@@ -12,6 +12,35 @@ from google3.experimental.users.qiaos.tpu_utils import route_check as RC
 from google3.experimental.users.qiaos.tpu_utils import route_lib as R
 
 
+# ★TESTS MUST NOT WRITE PRODUCTION STATE. run_reroute() falls back to the real
+# `~/.tpu_reroute_history.json` when no history_file is passed, and the global
+# brake reads that file: a test run that exercises the cancel path eight times
+# fills the hour window and SUSPENDS RE-ROUTING FLEET-WIDE for the next hour.
+# Measured 2026-09-05 -- eight rows written by one `python -m unittest` pass,
+# exactly REROUTE_GLOBAL_MAX_PER_HOUR, brake engaged, and nothing in the test
+# output said so because a green test says nothing about what it touched.
+# Redirecting the module constant here fixes every present and FUTURE caller,
+# which passing history_file= at each call site does not.
+_REAL_REROUTE_HISTORY_FILE = None
+_TMP_REROUTE_HISTORY = None
+
+
+def setUpModule():
+  global _REAL_REROUTE_HISTORY_FILE, _TMP_REROUTE_HISTORY
+  _REAL_REROUTE_HISTORY_FILE = RC.REROUTE_HISTORY_FILE
+  fh = tempfile.NamedTemporaryFile(suffix='.json', delete=False)
+  fh.write(b'[]')
+  fh.close()
+  _TMP_REROUTE_HISTORY = fh.name
+  RC.REROUTE_HISTORY_FILE = fh.name
+
+
+def tearDownModule():
+  RC.REROUTE_HISTORY_FILE = _REAL_REROUTE_HISTORY_FILE
+  if _TMP_REROUTE_HISTORY and os.path.exists(_TMP_REROUTE_HISTORY):
+    os.unlink(_TMP_REROUTE_HISTORY)
+
+
 def _entry(job_id='j1', power='v7-32', archs=('v7',), **kw):
   return R.QueueEntry(job_id=job_id, power=power, allowed_archs=list(archs), **kw)
 
@@ -36,11 +65,16 @@ class _FakeProvider:
 class _FakeSubmitter:
   """Records argv, returns a scripted xid (or None to simulate a dead launch)."""
 
-  def __init__(self, xid='555001'):
+  def __init__(self, xid='555001', name_lookup=None):
     self.calls = []
     self.cwds = []
     self.cancels = []
     self._xid = xid
+    # What find_xid_by_name should answer. Default: the lookup RAN and saw
+    # nothing -- the reading that lets a reclaimed row rebuild. Tests that
+    # exercise adoption pass an explicit (xid, how) pair.
+    self.name_lookups = []
+    self._name_lookup = name_lookup or (None, 'XM lookup ran and found no exact-name match')
 
   def submit(self, argv, cwd=''):
     self.calls.append(argv)
@@ -50,6 +84,91 @@ class _FakeSubmitter:
   def cancel(self, xid):
     self.cancels.append(xid)
     return True, 'stopped'
+
+  def find_xid_by_name(self, exp_name, timeout_s=120.0):
+    self.name_lookups.append(exp_name)
+    return self._name_lookup
+
+
+class AdoptEscapedBuildTest(unittest.TestCase):
+  """A stale BUILDING claim has two readings and the old code saw only one.
+
+  Obvious: the worker died mid-build, so requeue. Expensive: the build
+  SUCCEEDED, the experiment is live, and only the xid write-back was lost --
+  then requeuing puts a SECOND writer on the first one's output path.
+  Observed 2026-09-02 (elt-dit-50k-fid-v3b reclaimed to QUEUED while xid
+  285706173 ran). These tests pin the three-way resolution.
+  """
+
+  def _stale_building(self, jid='j', exp_name='my_exp'):
+    e = R.QueueEntry(job_id=jid, power='v6p-32', allowed_archs=['v6p'],
+                             launch_kwargs={'exp_name': exp_name} if exp_name else {})
+    e.state = R.JobState.BUILDING
+    e.build_started_at = 1000.0
+    R.reclaim_stale_building([e], now=1000.0 + 3600, stale_after_s=1800.0)
+    return e
+
+  def test_reclaim_parks_the_row_for_an_adopt_check(self):
+    e = self._stale_building()
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual(e.adopt_check_name, 'my_exp')
+
+  def test_parked_row_is_not_claimable(self):
+    """★The gate. Without this the flag would be a comment, not a safeguard."""
+    e = self._stale_building()
+    self.assertIsNone(R.next_queued([e]))
+    e.state = R.JobState.BUILD_REQUESTED
+    self.assertIsNone(R.next_build_requested([e]))
+
+  def test_a_clean_row_is_still_claimable_alongside_a_parked_one(self):
+    """Negative control: the gate must not wedge the whole queue."""
+    parked = self._stale_building('parked')
+    clean = R.QueueEntry(job_id='clean', power='v6p-32',
+                                 allowed_archs=['v6p'])
+    self.assertIs(R.next_queued([parked, clean]), clean)
+
+  def test_live_experiment_is_adopted_not_rebuilt(self):
+    e = self._stale_building()
+    sub = _FakeSubmitter(name_lookup=('285706173', 'XM lookup matched 1 experiment(s)'))
+    RC.adopt_escaped_builds([e], submitter=sub, dry_run=False)
+    self.assertEqual(e.xid, '285706173')
+    self.assertEqual(e.state, R.JobState.SUBMITTED)
+    self.assertIsNone(e.adopt_check_name)
+
+  def test_lookup_ran_and_found_nothing_releases_the_row(self):
+    e = self._stale_building()
+    sub = _FakeSubmitter(name_lookup=(None, 'XM lookup ran and found no exact-name match'))
+    RC.adopt_escaped_builds([e], submitter=sub, dry_run=False)
+    self.assertIsNone(e.adopt_check_name)
+    self.assertIs(R.next_queued([e]), e)
+
+  def test_lookup_that_could_not_run_keeps_the_row_parked(self):
+    """★'I could not see it' must not read as 'it is not there'. If this ever
+    inverts, the double-write returns through the failure path."""
+    e = self._stale_building()
+    sub = _FakeSubmitter(name_lookup=(None, 'XM lookup itself timed out; remote state UNKNOWN'))
+    RC.adopt_escaped_builds([e], submitter=sub, dry_run=False)
+    self.assertEqual(e.adopt_check_name, 'my_exp')
+    self.assertIsNone(R.next_queued([e]))
+
+  def test_dry_run_mutates_nothing(self):
+    e = self._stale_building()
+    sub = _FakeSubmitter(name_lookup=('999', 'XM lookup matched 1 experiment(s)'))
+    RC.adopt_escaped_builds([e], submitter=sub, dry_run=True)
+    self.assertIsNone(e.xid)
+    self.assertEqual(e.adopt_check_name, 'my_exp')
+
+  def test_a_healthy_build_is_untouched(self):
+    e = R.QueueEntry(job_id='fresh', power='v6p-32', allowed_archs=['v6p'])
+    e.state = R.JobState.BUILDING
+    e.build_started_at = 1000.0
+    self.assertEqual(R.reclaim_stale_building([e], 1060.0, 1800.0), [])
+    self.assertEqual(e.state, R.JobState.BUILDING)
+
+  def test_no_exp_name_cannot_be_adopt_checked(self):
+    e = self._stale_building(exp_name=None)
+    self.assertIsNone(e.adopt_check_name)
+    self.assertIn('cannot be ruled out', e.last_reason)
 
 
 class QueuePersistenceTest(unittest.TestCase):
@@ -252,7 +371,14 @@ class RunTickTest(unittest.TestCase):
     self.assertEqual(e.cell, 'yutulpz')
     self.assertEqual(e.arch, 'v7')
     self.assertEqual(e.chips, 32)
-    self.assertEqual(e.submitted_at, 100.0)
+    # submitted_at is "epoch when handed to XM", i.e. AFTER the (blocking)
+    # submit, not the epoch the round opened. This fake returns instantly, so
+    # the two differ only by the call's own microseconds -- but asserting exact
+    # equality here is what encoded the backdating bug as expected behaviour:
+    # with a real submitter that blocks for a 900-1700 s build, `now` is stale
+    # by exactly that much. See BackdatedSubmittedAtTest for the measured case.
+    self.assertAlmostEqual(e.submitted_at, 100.0, delta=1.0)
+    self.assertGreaterEqual(e.submitted_at, 100.0)
 
   def test_workdir_is_passed_to_submitter_as_cwd(self):
     # REGRESSION (monitor v21 field report): the router must package `tpu queue`
@@ -333,6 +459,11 @@ class _BudgetRefusedSubmitter:
     """Part of the _Submitter protocol; never exercised by these tests."""
     raise AssertionError(f'cancel({xid}) must not be called in this test')
 
+  def find_xid_by_name(self, exp_name, timeout_s=120.0):
+    # A budget refusal never created an experiment, so the lookup RAN and saw
+    # nothing -- the reading that lets the row be retried.
+    return None, 'XM lookup ran and found no exact-name match'
+
 
 def _submitted(job_id, xid, cell, submitted_at, **kw):
   e = _entry(job_id, **kw)
@@ -344,6 +475,11 @@ def _submitted(job_id, xid, cell, submitted_at, **kw):
   e.submitted_at = submitted_at
   return e
 
+
+  def find_xid_by_name(self, exp_name, timeout_s=120.0):
+    # A budget refusal never created an experiment, so the lookup RAN and saw
+    # nothing -- the reading that lets the row be retried.
+    return None, 'XM lookup ran and found no exact-name match'
 
 class ClassifyStateTest(unittest.TestCase):
 
@@ -1158,6 +1294,173 @@ class PriorXidsTest(unittest.TestCase):
     d.pop('prior_xids', None)
     back = R.QueueEntry.from_dict(d)
     self.assertEqual(back.prior_xids, [])
+
+class _FakeBorgProbe:
+  """Scripted has_running_vmgroup(): True / False / None (could not tell)."""
+
+  def __init__(self, answer):
+    self._answer = answer
+    self.calls = []
+
+  def has_running_vmgroup(self, entry):
+    self.calls.append(entry.job_id)
+    return self._answer
+
+
+def _running(job_id, xid, cell, submitted_at, **kw):
+  """A row already promoted to RUNNING -- the shape needs_reroute never sees."""
+  e = _entry(job_id, **kw)
+  e.state = R.JobState.RUNNING
+  e.xid = xid
+  e.cell = cell
+  e.arch = 'v7'
+  e.chips = 32
+  e.submitted_at = submitted_at
+  return e
+
+
+class BucketForEntryTest(unittest.TestCase):
+  """The disk guard can only see a job whose write location it can resolve."""
+
+  def test_explicit_bucket_wins(self):
+    e = _entry('j1')
+    e.launch_kwargs = {'bucket': '/cns/is-d/home/qiaos/eqr_data'}
+    e.cell = 'lb'  # would resolve to li-d; the explicit flag must outrank it
+    self.assertEqual(RC._bucket_for_entry(e), '/cns/is-d/home/qiaos/eqr_data')
+
+  def test_resolved_from_cell_when_no_bucket(self):
+    # ★THE REGRESSION THIS FILE EXISTS FOR. A multi-metro job passes no
+    # --bucket (a hardcoded one writes cross-metro and gets it pruned), so the
+    # old probe read None and the disk guard was dead for exactly the jobs the
+    # guides prescribe. `lb` is in metro lpp, whose storage cell is li-d.
+    e = _entry('j1')
+    e.launch_kwargs = {'exp_name': 'x'}
+    e.cell = 'lb'
+    self.assertEqual(RC._bucket_for_entry(e),
+                     '/cns/li-d/home/qiaos/eqr_data')
+
+  def test_no_cell_no_bucket_is_none(self):
+    e = _entry('j1')
+    e.launch_kwargs = {}
+    e.cell = None
+    self.assertIsNone(RC._bucket_for_entry(e))
+
+  def test_unknown_cell_refuses_to_guess(self):
+    # An unmeasured cell must NOT fall through to a default prefix: the wrong
+    # path is a perfectly valid path, which is how a job wrote across a
+    # continent and was deleted mid-run.
+    e = _entry('j1')
+    e.launch_kwargs = {}
+    e.cell = 'no_such_cell_xyz'
+    self.assertIsNone(RC._bucket_for_entry(e))
+
+
+class NominalRunningRerouteTest(unittest.TestCase):
+  """XM RUNNING is not 'has chips'. Reproduces xid 286573746: 12 h in one cell,
+  every Borg VM group PENDING, zero bytes written, while XManager and the queue
+  both said RUNNING and nothing existed that could move it."""
+
+  def setUp(self):
+    self._hist = tempfile.NamedTemporaryFile(suffix='.json', delete=False)
+    self._hist.write(b'[]')
+    self._hist.close()
+    self.addCleanup(os.unlink, self._hist.name)
+
+  def _run(self, entry, borg_answer, mtime=None, now=7200.0, grace=3600.0,
+           dry_run=False):
+    probe = _FakeProbe({entry.xid: RC.STATUS_RUNNING})
+    sub = _FakeSubmitter()
+    borg = _FakeBorgProbe(borg_answer)
+    _, log = RC.run_reroute(
+        [entry], now=now, probe=probe, submitter=sub, reroute_after_s=600.0,
+        cooldown_s=1800.0, dry_run=dry_run, output_probe=_FakeOutputProbe({entry.xid: mtime}),
+        sleep_fn=lambda _: None, history_file=self._hist.name,
+        borg_probe=borg, nominal_running_grace_s=grace)
+    return sub, log, borg
+
+  def test_no_vmgroup_running_and_no_output_is_rerouted(self):
+    e = _running('j1', '111', 'sj', submitted_at=0.0)
+    sub, log, borg = self._run(e, borg_answer=False, mtime=None)
+    self.assertEqual(sub.cancels, ['111'])              # the 12-hour case acts
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertIsNone(e.xid)
+    self.assertGreater(e.cooldown_cells.get('sj', 0), 7200.0)
+    self.assertTrue(any('nominally RUNNING' in l for l in log))
+    self.assertEqual(borg.calls, ['j1'])                # Borg was consulted
+
+  def test_vmgroup_running_is_left_alone(self):
+    e = _running('j1', '111', 'sj', submitted_at=0.0)
+    sub, log, _ = self._run(e, borg_answer=True, mtime=None)
+    self.assertEqual(sub.cancels, [])                   # a live car is untouched
+    self.assertEqual(e.state, R.JobState.RUNNING)
+    self.assertTrue(any('borg vmgroup RUN' in l for l in log))
+
+  def test_unreadable_borg_fails_open(self):
+    # None is 'could not tell', never 'not running'. An unreadable probe must
+    # not become a cancellation.
+    e = _running('j1', '111', 'sj', submitted_at=0.0)
+    sub, log, _ = self._run(e, borg_answer=None, mtime=None)
+    self.assertEqual(sub.cancels, [])
+    self.assertEqual(e.state, R.JobState.RUNNING)
+    self.assertTrue(any('borg unreadable' in l for l in log))
+
+  def test_output_on_disk_beats_borg(self):
+    # It wrote something, so it had hardware at some point: promote.
+    e = _running('j1', '111', 'sj', submitted_at=0.0)
+    sub, log, _ = self._run(e, borg_answer=False, mtime=6000.0)
+    self.assertEqual(sub.cancels, [])
+    self.assertEqual(e.state, R.JobState.RUNNING)
+    self.assertTrue(any('output written' in l for l in log))
+
+  def test_within_grace_is_left_alone(self):
+    # A young row is still coming up; the grace period must gate the verdict.
+    e = _running('j1', '111', 'sj', submitted_at=0.0)
+    sub, _, borg = self._run(e, borg_answer=False, mtime=None, now=1800.0,
+                             grace=3600.0)
+    self.assertEqual(sub.cancels, [])
+    self.assertEqual(e.state, R.JobState.RUNNING)
+    self.assertEqual(borg.calls, [])          # not even selected yet
+
+  def test_dry_run_reports_but_does_not_cancel(self):
+    e = _running('j1', '111', 'sj', submitted_at=0.0)
+    sub, log, _ = self._run(e, borg_answer=False, mtime=None, dry_run=True)
+    self.assertEqual(sub.cancels, [])
+    self.assertEqual(e.state, R.JobState.RUNNING)
+    self.assertTrue(any('[DRY][reroute]' in l and 'NO Borg VM group' in l
+                        for l in log))
+
+  def test_high_reroute_count_is_still_rechecked_and_rerouted(self):
+    # The give-up bound was REMOVED 2026-09-11 (operator request): a high
+    # reroute count no longer exempts a nominally-RUNNING row from the liveness
+    # recheck. With no Borg VM group and nothing written, it is re-routed like
+    # any other dead row -- it is never auto-parked for churning.
+    e = _running('j1', '111', 'sj', submitted_at=0.0)
+    e.reroutes = 99
+    sub, _, borg = self._run(e, borg_answer=False, mtime=None)
+    self.assertEqual(sub.cancels, ['111'])
+    self.assertEqual(e.state, R.JobState.QUEUED)
+    self.assertEqual(borg.calls, ['j1'])
+
+
+class NeedsLivenessRecheckTest(unittest.TestCase):
+
+  def test_running_past_grace_selected(self):
+    e = _running('j1', '111', 'sj', submitted_at=0.0)
+    self.assertTrue(R.needs_liveness_recheck(e, now=4000.0, grace_s=3600.0))
+
+  def test_running_within_grace_not_selected(self):
+    e = _running('j1', '111', 'sj', submitted_at=0.0)
+    self.assertFalse(R.needs_liveness_recheck(e, now=3000.0, grace_s=3600.0))
+
+  def test_submitted_row_is_not_this_functions_business(self):
+    e = _submitted('j1', '111', 'sj', submitted_at=0.0)
+    self.assertFalse(R.needs_liveness_recheck(e, now=99999.0, grace_s=3600.0))
+
+  def test_missing_submitted_at_is_not_selected(self):
+    e = _running('j1', '111', 'sj', submitted_at=0.0)
+    e.submitted_at = None
+    self.assertFalse(R.needs_liveness_recheck(e, now=99999.0, grace_s=3600.0))
+
 
 if __name__ == '__main__':
   unittest.main()

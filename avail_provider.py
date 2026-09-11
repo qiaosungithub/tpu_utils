@@ -146,6 +146,52 @@ def load_prices(market_json_path: str = DEFAULT_MARKET_JSON,
   return out
 
 
+def load_cell_prices(market_json_path: str = DEFAULT_MARKET_JSON,
+                     pool: str = DEFAULT_PRICE_POOL) -> dict[str, dict[str, float]]:
+  """arch -> {cell -> credits/chip-hr}, the PER-CELL prices in the same layer.
+
+  ★THE PRICES WERE ALWAYS THERE; the router just never read them. Each market
+  layer holds `global` PLUS one entry per cell, and inside one arch they differ
+  by up to 3.2x -- v6e measured 15.999 (x102 cells) and 51.923 (x13 cells) in
+  the same snapshot, v6p 14.404/28.261, v5p 15.475/33.692. `load_prices` takes
+  only `global`, so every cell of an arch reached the router with an identical
+  price and the cell-level sort had nothing to rank on.
+
+  Invalid entries are DROPPED, not defaulted:
+    * `None`   -- GQM quotes no price for that cell (v7's yuphxrp). A cell with
+                  no price is one we cannot cost, and guessing the global value
+                  for it is how a cell you cannot actually get ends up looking
+                  like the cheapest option.
+    * non-numeric -- same reasoning.
+  A price of 0.0 is KEPT: a free pool is a real state (v4/v6e whole layers sit
+  at 0.0), not missing data.
+
+  Returns {} if the cache is missing; callers fall back to the global price,
+  i.e. exactly today's behaviour.
+  """
+  try:
+    with open(market_json_path) as f:
+      market = json.load(f)
+  except (OSError, ValueError):
+    return {}
+  prices = market.get('prices', {})
+  out: dict[str, dict[str, float]] = {}
+  for arch, cards in ARCH_CARDS.items():
+    for card in cards:
+      layer = prices.get(f'{pool}|{card}|PROD')
+      if not isinstance(layer, dict) or 'global' not in layer:
+        continue
+      per_cell: dict[str, float] = {}
+      for cell, val in layer.items():
+        if cell == 'global' or not isinstance(val, (int, float)):
+          continue          # drops None and any non-numeric quote
+        per_cell[cell] = float(val)
+      if per_cell:
+        out[arch] = per_cell
+      break
+  return out
+
+
 def parse_cell_availability(resp: Any, platform_int: int) -> dict[str, tuple[int, bool]]:
   """cell -> (free_chips, oversold) for ONE platform, from a GetCellAvailability
   response. Pure: `resp` is the proto (or a duck-typed fake for tests).
@@ -173,6 +219,7 @@ def parse_cell_availability(resp: Any, platform_int: int) -> dict[str, tuple[int
 def build_availability(
     per_arch: dict[str, dict[str, tuple[int, bool]]],
     arch_price: dict[str, float],
+    cell_price: Optional[dict[str, dict[str, float]]] = None,
 ) -> tuple[dict[str, route_lib.CellAvail], dict[str, float], dict[str, float]]:
   """Assemble the router's three inputs from parsed per-arch cell data. Pure.
 
@@ -185,17 +232,24 @@ def build_availability(
   and the router would never see it. route_lib scans .values() filtered by arch
   and matches placements by content, so the key shape is opaque to it.
   arch_pool[arch] = sum of free chips across that arch's cells (live magnitude).
+
+  `cell_price[arch][cell]` (from `load_cell_prices`) gives each CellAvail its
+  OWN price. A cell missing from that map falls back to the arch's global price
+  -- which is the pre-2026-08-31 behaviour for every cell, so an absent or
+  stale market cache degrades to exactly what the router did before.
   """
   avail_by_cell: dict[str, route_lib.CellAvail] = {}
   arch_pool: dict[str, float] = {}
+  cell_price = cell_price or {}
   for arch, cells in per_arch.items():
     pool = 0
     price = arch_price.get(arch)
+    by_cell = cell_price.get(arch, {})
     for cell, (free_chips, oversold) in cells.items():
       pool += max(0, free_chips)
       avail_by_cell[f'{cell}|{arch}'] = route_lib.CellAvail(
           cell=cell, arch=arch, free_chips=free_chips, oversold=oversold,
-          price=price, metro=metro_str(cell))
+          price=by_cell.get(cell, price), metro=metro_str(cell))
     arch_pool[arch] = float(pool)
   return avail_by_cell, arch_price, arch_pool
 
@@ -428,5 +482,9 @@ class AvailabilityProvider:
       per_arch[arch] = parse_cell_availability(resp, platform_int)
 
     arch_price = load_prices(self.market_json_path)
-    return build_availability(per_arch, arch_price)
+    # Two reads of the same file, deliberately: the ARCH score wants one price
+    # per arch, the CELL score wants each cell's own. Conflating them is what
+    # made the cell-level sort price-blind.
+    cell_price = load_cell_prices(self.market_json_path)
+    return build_availability(per_arch, arch_price, cell_price)
 

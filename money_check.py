@@ -10,6 +10,165 @@ from absl import app
 import os
 import re
 import ast
+import sys
+import time
+
+# --- stage timing -----------------------------------------------------------
+# ★Why this exists: this binary's WALL TIME was the only number anyone had, and
+# it sat at 40-75s against a 300s watchdog -- i.e. most of the budget was gone
+# before anything went wrong, and nobody could say to WHAT. A p99 taken from
+# timeouts alone is censored: it only ever sees the runs that blew the gate.
+# Stages are printed to stderr so the cache file (stdout -> money.txt) is
+# byte-identical to before; nothing downstream parses stderr.
+_T0 = time.time()
+_STAGES: list[tuple[str, float]] = []
+# Accumulators for the per-group loop (9 groups x 4 serial RPCs), kept as
+# one-element lists so the loop body can add to them without a `global`.
+_T_BIDPOWER = [0.0]
+_T_USAGE = [0.0]
+_T_BALANCE = [0.0]
+
+# --- bidding-power timeout + degrade ----------------------------------------
+# ★WHY: get_bidding_power() reaches Mendel (the experiment-flag framework) on
+# its first call. Measured across 62 logs on 2026-09-01, that call either
+# returns -- anywhere from 5s to 244s -- or NEVER returns, hanging with zero log
+# output until the watchdog kills the process. A killed process never reaches
+# write_to_cache(), so money.txt does not merely go stale: it stops entirely.
+# The two outcomes are perfectly separable in the logs (a completed round emits
+# 25 `mendel_flags` lines; a hung one emits 0), so a timeout converts an
+# unbounded hang into a bounded, reported degradation.
+#
+# ★BUDGETS ARE DERIVED FROM THE OUTER GATE, NOT CHOSEN FOR CONVENIENCE.
+# tpu_check_daemon.sh runs this binary under `timeout -k 10 300`, so 300s is
+# the whole process budget, not a per-call one. The guard must leave room for
+# one more full-length call plus the rest of the round:
+#     guard 120 + one call 90 + remaining work ~20 = 230s < 300s   SAFE
+#     guard 200 + one call 90 + remaining work ~20 = 310s > 300s   KILLED
+# The 200s variant would be killed on the worst-case path -- destroying the very
+# guarantee the degrade path exists to provide. ★If the outer gate in
+# tpu_check_daemon.sh changes, RE-DERIVE these two numbers; they are a railing
+# sized to that fence, not a probe tuned to fire often.
+# Overridable ONLY so the degrade path can be exercised against the REAL
+# binary without waiting for Mendel to hang. Defaults are the derived values
+# above and are what every production round uses; nothing sets these env vars
+# outside a verification run. ★A degrade path that can only be observed during
+# a real outage is a path nobody has ever seen work.
+_BP_CALL_TIMEOUT_S = float(os.environ.get('MONEY_BP_CALL_TIMEOUT_S', 90.0))
+_BP_TOTAL_BUDGET_S = float(os.environ.get('MONEY_BP_TOTAL_BUDGET_S', 120.0))
+
+# Two counters, deliberately NOT merged: a single slow call and an exhausted
+# round budget are different failures. All-single means Mendel is slow; any
+# budget hit means the round could not finish in time whatever the cause.
+_N_DEGRADED_TIMEOUT = [0]   # this call exceeded _BP_CALL_TIMEOUT_S
+_N_DEGRADED_BUDGET = [0]    # skipped: cumulative budget already spent
+
+
+def _degrade_log_path() -> str:
+  return os.path.join(os.path.expanduser('~/.tpu_quota_cache_dir'),
+                      'money_check_degrade_count.json')
+
+
+def _record_degrades(n_timeout: int, n_budget: int) -> None:
+  """Append this round's degrade counts to an on-disk tally. Never raises.
+
+  ★Persisted because the interesting signal is a RATE: one degraded round is
+  Mendel having a bad minute, a degraded round every hour is Mendel broken and
+  nobody would see it from a single run's stderr.
+  """
+  if not n_timeout and not n_budget:
+    return
+  try:
+    import json
+    path = _degrade_log_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+      with open(path, encoding='utf-8') as f:
+        tally = json.load(f)
+    except Exception:  # pylint: disable=broad-except
+      tally = {}
+    tally['calls_timed_out'] = int(tally.get('calls_timed_out', 0)) + n_timeout
+    tally['calls_over_budget'] = int(
+        tally.get('calls_over_budget', 0)) + n_budget
+    tally['rounds_degraded'] = int(tally.get('rounds_degraded', 0)) + 1
+    tally['last_degraded_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                                               time.gmtime())
+    # tmp+rename: a reader must never see a half-written tally.
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+      json.dump(tally, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+  except Exception:  # pylint: disable=broad-except
+    pass
+
+
+def _call_bidding_power_guarded(fn_bp, mdb_name):
+  """Call get_bidding_power under a wall-clock cap. Returns (raw, status).
+
+  status is one of 'ok', 'timeout', 'budget', 'error'. ★The call runs on a
+  daemon thread rather than SIGALRM because the hang is inside C++ RPC code
+  that does not honour Python signal delivery, and because main() must stay
+  usable from a non-main thread. A timed-out thread is abandoned, not killed:
+  it holds no lock we need, and the process exits shortly after.
+  """
+  if _T_BIDPOWER[0] >= _BP_TOTAL_BUDGET_S:
+    _N_DEGRADED_BUDGET[0] += 1
+    return None, 'budget'
+
+  import threading
+  box: dict = {}
+
+  def _run():
+    try:
+      box['v'] = fn_bp(mdb_name)
+    except Exception as e:  # pylint: disable=broad-except
+      box['e'] = e
+
+  th = threading.Thread(target=_run, daemon=True)
+  th.start()
+  th.join(_BP_CALL_TIMEOUT_S)
+  if th.is_alive():
+    _N_DEGRADED_TIMEOUT[0] += 1
+    return None, 'timeout'
+  if 'e' in box:
+    return box['e'], 'error'
+  return box.get('v'), 'ok'
+
+
+def _stage(name: str) -> None:
+  """Record cumulative elapsed at a named boundary. Never raises."""
+  try:
+    _STAGES.append((name, time.time() - _T0))
+  except Exception:  # pylint: disable=broad-except
+    pass
+
+
+def _dump_stages() -> None:
+  """Emit per-stage deltas, slowest first, plus the total. stderr only."""
+  try:
+    prev = 0.0
+    rows = []
+    for name, at in _STAGES:
+      rows.append((at - prev, name, at))
+      prev = at
+    total = _STAGES[-1][1] if _STAGES else 0.0
+    parts = ' '.join(f'{n}={d:.1f}s' for d, n, _ in rows)
+    print(f'[money_check timing] total={total:.1f}s {parts}', file=sys.stderr)
+    print(f'[money_check timing] per-group RPCs (9 groups, serial): '
+          f'bidding_power={_T_BIDPOWER[0]:.1f}s '
+          f'resource_usage={_T_USAGE[0]:.1f}s '
+          f'balance={_T_BALANCE[0]:.1f}s', file=sys.stderr)
+    print(f'[money_check timing] degraded: '
+          f'call_timeout={_N_DEGRADED_TIMEOUT[0]} '
+          f'over_budget={_N_DEGRADED_BUDGET[0]} '
+          f'(caps: call={int(_BP_CALL_TIMEOUT_S)}s '
+          f'round={int(_BP_TOTAL_BUDGET_S)}s)', file=sys.stderr)
+    worst = max(rows, default=None)
+    if worst and total > 0:
+      print(f'[money_check timing] slowest stage: {worst[1]} '
+            f'{worst[0]:.1f}s ({100.0 * worst[0] / total:.0f}% of total)',
+            file=sys.stderr)
+  except Exception:  # pylint: disable=broad-except
+    pass
 
 # Sentinel decoding (INT64_MAX = unobtainable, INT64_MIN = no bid, 0 = a real
 # free-pool price) lives in preflight.market.decode_price, so this renderer and
@@ -406,12 +565,14 @@ def main(argv):
 
     # Dynamically import gqm_tool
     gqm_tool = None
+    _stage('startup')
     try:
         import importlib
         gqm_module = importlib.import_module("google3.learning.agents.orcas.tools.gqm_tool.gqm_tool")
         gqm_tool = gqm_module
     except Exception:
         pass
+    _stage('import_gqm_tool')
 
     # 1. Ultra-clean MDB Groups Money Table
     resources, group_mapping = group_utils.get_group_mapping()
@@ -436,17 +597,36 @@ def main(argv):
         mdb_name = alloc.split('/')[-1]
         bp_formatted = "[dim]0.0 Credits/hr[/dim]"
         if gqm_tool:
+            _t_bp = time.time()
             try:
                 fn_bp = getattr(gqm_tool, "get_bidding_power", None)
                 if callable(fn_bp):
-                    raw_bp = fn_bp(mdb_name)
-                    bp_formatted = parse_bidding_power(raw_bp)
+                    raw_bp, _bp_status = _call_bidding_power_guarded(
+                        fn_bp, mdb_name)
+                    if _bp_status == 'ok':
+                        bp_formatted = parse_bidding_power(raw_bp)
+                    elif _bp_status == 'timeout':
+                        # ★Marked, never silent: a degraded cell must not be
+                        # mistaken for a real 0.0. Whoever reads money.txt is
+                        # deciding whether to spend, so "we do not know" and
+                        # "you have none" must not render the same.
+                        bp_formatted = (
+                            f"[yellow]? DEGRADED (timeout "
+                            f"{int(_BP_CALL_TIMEOUT_S)}s)[/yellow]")
+                    elif _bp_status == 'budget':
+                        bp_formatted = (
+                            "[yellow]? DEGRADED (round budget spent)"
+                            "[/yellow]")
+                    else:
+                        bp_formatted = f"[red]Err: {raw_bp}[/red]"
             except Exception as e:
                 bp_formatted = f"[red]Err: {e}[/red]"
+            _T_BIDPOWER[0] += time.time() - _t_bp
 
         # Calculate PROD and BATCH current usage
         prod_info = "0.0"
         batch_info = "0.0"
+        _t_usage = time.time()
         try:
             prod_u = resource_service.get_resource_usage(alloc, ["HighlyAvailable"])
             batch_u = resource_service.get_resource_usage(alloc, ["NonProd"])
@@ -462,8 +642,11 @@ def main(argv):
                         batch_info = f"{float(getattr(batch_u, f.name)):,.0f}"
         except Exception:
             pass
+        _T_USAGE[0] += time.time() - _t_usage
 
+        _t_bal = time.time()
         balance = fetch_balance(gqm_tool, mdb_name)
+        _T_BALANCE[0] += time.time() - _t_bal
         if balance is None:
             bal_str = "[dim]n/a (static pool)[/dim]"
         elif balance <= 0:
@@ -474,14 +657,32 @@ def main(argv):
         money_table.add_row(f"G{idx}", prod_info, batch_info, bp_formatted,
                             bal_str)
 
+    _stage('group_loop_9x')
     out += render(money_table) + "\n"
+
+    # ★Round-level banner, in money.txt itself (stdout) and not only on stderr:
+    # a degraded round must not be byte-shaped like a healthy one. A reader who
+    # only ever sees the table would otherwise treat partial data as complete.
+    if _N_DEGRADED_TIMEOUT[0] or _N_DEGRADED_BUDGET[0]:
+        out += render(
+            f"[bold yellow]⚠ DEGRADED ROUND: bidding power unavailable for "
+            f"{_N_DEGRADED_TIMEOUT[0] + _N_DEGRADED_BUDGET[0]} of "
+            f"{len(group_mapping)} groups "
+            f"({_N_DEGRADED_TIMEOUT[0]} call timeout >"
+            f"{int(_BP_CALL_TIMEOUT_S)}s, "
+            f"{_N_DEGRADED_BUDGET[0]} over round budget "
+            f"{int(_BP_TOTAL_BUDGET_S)}s). Rows marked DEGRADED are NOT zero "
+            f"-- they are unknown.[/bold yellow]\n")
+        _record_degrades(_N_DEGRADED_TIMEOUT[0], _N_DEGRADED_BUDGET[0])
 
     # 2. Market Prices Table — filtered to OUR pools + both BATCH & PROD.
     my_pools = _extract_my_pools(resources)
     spanner_prices = fetch_prices_from_spanner(gqm_tool, my_pools=my_pools) if gqm_tool else {}
+    _stage('fetch_prices_spanner')
     limit_order_pools: dict[tuple, str] = {}
     limit_orders = (fetch_limit_orders(gqm_tool, pools_out=limit_order_pools)
                     if gqm_tool else {})
+    _stage('fetch_limit_orders')
     my_mdbs = {a.split('/')[-1] for a in group_mapping.values() if a}
 
     # Machine-readable twin of the table below, for `tpu route`. Written from
@@ -607,7 +808,10 @@ def main(argv):
         "guarantee free chips exist, and BATCH is always preemptible.[/dim]")
     out += render("[dim]Tip: Run 'tpu quota -l' to see full MDB allocation paths for each group.[/dim]")
 
+    _stage('render_tables')
     write_to_cache("money.txt", out)
+    _stage('write_cache')
+    _dump_stages()
     print("Successfully written money.txt cache (PROD+BATCH prices, limit orders).")
     print(market_note)
 

@@ -92,6 +92,10 @@ def _candidate_json(c, rank_index):
       'status': c.verdict.status.value,
       'quota': cap.alloc_scoped_quota if cap else 0,
       'used': cap.alloc_scoped_used if cap else 0,
+      # False when the floor_v2 read FAILED, so a consumer can tell "no floor"
+      # from "could not look". `quota` stays an int either way; older parsers
+      # (tpu_wrapper.sh) ignore this key.
+      'quota_readable': (cap.quota_readable if cap else False),
       'reasons': list(c.verdict.reasons),
       # --- added by the GQM upgrade ---
       'cell': c.cell,
@@ -173,19 +177,16 @@ def main(argv):
   progress = ((lambda s: print(f'  [router] {s}', file=sys.stderr))
               if _VERBOSE.value else None)
 
-  # --explain needs the combos that ranking would have truncated away, so it
-  # asks for everything and slices locally.
-  want_all = _EXPLAIN.value
+  # ALWAYS ask for the full ranking and slice locally. `--top` is a display
+  # window, and the table has to be able to say "showing 3 of 47" -- a count it
+  # cannot have if the truncation happened upstream. This costs nothing: every
+  # candidate is probed and ranked regardless, and `route`'s `top_k` only
+  # slices the finished list (see `router.route`'s last line). Asking for the
+  # top 3 never made the router do less work, it only made it say less.
   try:
-    if want_all:
-      ranked_all, snapshot = router.route_all(
-          power=_POWER.value, tier=_TIER.value, groups=groups,
-          tolerance=_TOL.value, progress_fn=progress, metros=metros)
-    else:
-      ranked_all, snapshot = router.route(
-          power=_POWER.value, tier=_TIER.value, groups=groups,
-          tolerance=_TOL.value, top_k=_TOP.value, progress_fn=progress,
-          metros=metros)
+    ranked_all, snapshot = router.route_all(
+        power=_POWER.value, tier=_TIER.value, groups=groups,
+        tolerance=_TOL.value, progress_fn=progress, metros=metros)
   except Exception as e:  # pylint: disable=broad-except
     print(f'router error: {type(e).__name__}: {e}', file=sys.stderr)
     return 2
@@ -234,12 +235,24 @@ def main(argv):
   print('  ' + '-' * (len(header) - 2))
   for i, c in enumerate(ranked):
     cap = c.verdict.capacity
-    quota = cap.alloc_scoped_quota if cap else 0
+    # A failed floor_v2 read used to print as a confident `0`, which reads as
+    # "this alloc has no capacity" and has been acted on as such. `?` is the
+    # honest rendering: the instrument did not answer.
+    if cap is None:
+      quota = '?'
+    elif not cap.quota_readable:
+      quota = '?'
+    else:
+      quota = str(cap.alloc_scoped_quota)
     # For BATCH the floor is never consulted at admission time, so showing
     # "quota headroom" there would be inviting the user to rank on noise.
     # Show obtainable chips in the chosen cell instead.
     if _TIER.value.upper() == 'BATCH':
       headroom = f'{c.obtainable}/{c.chips}={int(c.obtainable_ratio)}x obt'
+    elif quota == '?':
+      # Headroom is computed from the same unreadable number; printing
+      # "0/32=0x" here would re-tell the same lie in a second column.
+      headroom = f'?/{c.chips}' if c.chips else '?'
     else:
       headroom = (f'{c.remaining_quota}/{c.chips}={int(c.headroom_ratio)}x'
                   if c.chips else '?')
@@ -251,6 +264,22 @@ def main(argv):
           f"{status_disp:<17} {quota:<8} {headroom:<11} "
           f"{_fmt_price(c.price):<8} {_fmt_cost(c.cost_per_hour):<9} "
           f"{reasons_str}")
+
+  # ★Say how much of the answer this is. The table is a ranked WINDOW (--top,
+  # default 3), and a window that does not announce its own size reads as the
+  # whole fleet: a line concluded "only one cell exists for v7-32" from three
+  # rows, and planned a cross-metro checkpoint move on it. Printed whether or
+  # not anything was truncated, so its absence never has to be interpreted.
+  hidden = len(runnable) - len(ranked)
+  scope = ('groups ' + ','.join(f'g{g}' for g in groups)
+           if groups else 'all groups')
+  if hidden > 0:
+    print(f"{DIM}  showing {len(ranked)} of {len(runnable)} runnable "
+          f"placements across {scope} ({hidden} hidden; --top=N for more)"
+          f"{RESET}")
+  else:
+    print(f"{DIM}  showing all {len(runnable)} runnable placement(s) across "
+          f"{scope}.{RESET}")
 
   if _TIER.value.upper() == 'BATCH':
     print(f"{DIM}  BATCH is ranked on obtainable chips, not quota: the BATCH "
